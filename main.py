@@ -68,6 +68,15 @@ class ExecutionFill:
 
 
 @dataclasses.dataclass
+class DailyPortfolioValue:
+    """Snapshot of total account value on a given trading day (marked-to-market)."""
+    date: str
+    portfolio_value: float
+    cash_balance: float
+    positions: Dict[str, float]
+
+
+@dataclasses.dataclass
 class ReplayConfig:
     maker_fee_bps: float = -1.0  # Liquidity rebate (-1 bps)
     taker_fee_bps: float = 5.0    # Liquidity removal fee (+5 bps)
@@ -90,6 +99,7 @@ class ExecutionReplayEngine:
         self.cash_balance: float = config.initial_cash
         self.positions: Dict[str, float] = {}  # Symbol -> Quantity
         self.execution_log: List[ExecutionFill] = []
+        self.daily_portfolio_log: List[DailyPortfolioValue] = []
 
     def _calculate_market_impact(self, quantity: float, snapshot: MarketDataSnapshot) -> float:
         """
@@ -187,6 +197,23 @@ class ExecutionReplayEngine:
         )
         return self.cash_balance + positions_value
 
+    def record_daily_value(self, date: str, closing_prices: Dict[str, float]) -> DailyPortfolioValue:
+        """
+        Marks the account to market using a given day's closing prices and appends
+        the result to the daily portfolio log. Call this once per trading day
+        (including days with no fills) so the resulting series has no gaps.
+        """
+        portfolio_value = self.compute_portfolio_value(closing_prices)
+
+        snapshot = DailyPortfolioValue(
+            date=date,
+            portfolio_value=portfolio_value,
+            cash_balance=self.cash_balance,
+            positions=dict(self.positions)  # snapshot copy, not a live reference
+        )
+        self.daily_portfolio_log.append(snapshot)
+        return snapshot
+
     def calculate_breakeven_threshold(self, step_bps: float = 1.0, max_bps: float = 100.0) -> float:
         """Re-evaluates logged trades across increasing fee steps to find zero-PnL threshold."""
         if not self.execution_log:
@@ -211,18 +238,37 @@ class ExecutionReplayEngine:
         return max_bps
 
     def export_logs_to_json(self, filepath: str):
-        """Exports execution logs to a JSON file using standard Python library."""
-        log_dicts = []
+        """
+        Exports execution logs to a JSON file using the standard library.
+
+        The exported file has two top-level keys:
+          - "fills": the per-order execution log (unchanged from before)
+          - "daily_portfolio_values": one mark-to-market snapshot per trading day,
+            populated via record_daily_value(), which lets downstream Sharpe/Sortino/
+            max-drawdown/net-return calculations see account value on days with no
+            trades, not just fill-level PnL.
+        """
+        fill_dicts = []
         for fill in self.execution_log:
             record = dataclasses.asdict(fill)
             record['side'] = fill.side.value
             record['regime'] = fill.regime.value
-            log_dicts.append(record)
+            fill_dicts.append(record)
+
+        daily_value_dicts = [dataclasses.asdict(entry) for entry in self.daily_portfolio_log]
+
+        export_payload = {
+            "fills": fill_dicts,
+            "daily_portfolio_values": daily_value_dicts
+        }
 
         with open(filepath, 'w') as f:
-            json.dump(log_dicts, f, indent=4)
+            json.dump(export_payload, f, indent=4)
 
-        print(f"Successfully exported {len(log_dicts)} execution log record(s) to '{filepath}'")
+        print(
+            f"Successfully exported {len(fill_dicts)} execution log record(s) and "
+            f"{len(daily_value_dicts)} daily portfolio value record(s) to '{filepath}'"
+        )
 
 
 # =====================================================================
@@ -297,8 +343,14 @@ def run_simulation_demo():
         print(f"  Fee Paid:        ${fill.fee_paid:.4f} (Is Maker: {fill.is_maker})")
         print(f"  Regime Tag:      {fill.regime.value}\n")
 
-    # Mark-to-Market Valuation
-    latest_prices = {"AAPL": 182.50}
+    # --- Daily Mark-to-Market Snapshots ---
+    # In a full backtest this would be called once per trading day (including
+    # days with no fills) using that day's closing prices. Here we simulate
+    # two consecutive closes for demonstration.
+    engine.record_daily_value("2026-03-15", {"AAPL": 182.50})
+    engine.record_daily_value("2026-03-16", {"AAPL": 183.75})
+
+    latest_prices = {"AAPL": 183.75}
     total_val = engine.compute_portfolio_value(latest_prices)
     net_pnl = total_val - config.initial_cash
 
