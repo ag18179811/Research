@@ -1,23 +1,4 @@
-"""THE MISSING FOURTH PILLAR: coordination-cost accounting.
-
-The proposal promises four things enforced jointly:
-    1. temporal integrity      -> dataprep.PointInTimeStore          DONE
-    2. execution realism       -> execution_replay + execution_fixes DONE
-    3. coordination-cost accounting                                  <-- NOT BUILT
-    4. regime-robust evaluation-> label_regimes + regime_robustness   DONE
-
-Nothing in the current pipeline charges a multi-agent system anything for
-being a multi-agent system. `comparison.coordination_breakeven_spread` sweeps
-*trading* fees only, so a committee of twelve LLM analysts and a single
-if-statement are billed identically. The proposal's own Motivation cites
-Kim2025 on exactly this -- "additional agents increase token usage and latency
-without necessarily improving performance" -- and then the code measures
-neither.
-
-That matters more than it sounds. It is the pillar that separates this paper
-from the taxonomy paper it builds on: that paper *proposed* CBS, and if your
-CBS only charges exchange fees you have implemented their concept without the
-part that makes coordination falsifiable.
+"""
 
 WHAT THIS MODULE ADDS
 ---------------------
