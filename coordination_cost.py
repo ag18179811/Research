@@ -13,17 +13,36 @@ C. `coordination_adjusted_cbs`: CBS where the coordinated system also pays its
 D. `coordination_ablation`: same signals, same episodes, same seeds, N analysts
    vs 1 -- the controlled experiment that isolates coordination from strategy.
 
+USAGE
+-----
+    from agent_payload import resolve_counter
     from coordination_cost import CoordinationMeter, CoordinationCostConfig
-    metered = CoordinationMeter(my_agent, CoordinationCostConfig())
-    runs = run_all_episodes(metered, ...)
+    from metered_committee import MeteredCommittee
+
+    counter = resolve_counter("claude-opus-5")       # count_tokens if creds exist
+    agent   = MeteredCommittee(tickers, counter, n_analysts=8)
+    metered = CoordinationMeter(agent, CoordinationCostConfig(model="claude-opus-5"))
+    runs    = run_all_episodes(metered, ...)
     print(metered.report())
+
+`run_cbs.py` runs the whole thing end to end.
+
+THE METER IS ONLY AS GOOD AS THE AGENT UNDER IT
+-----------------------------------------------
+CoordinationMeter cannot invent token counts. An agent that exposes neither
+`last_usage()` nor `n_agents` -- which is what `build_trading_agents_adapter`
+returns today -- meters latency only and reports a token bill of $0.00.
+report() labels that case "ASSUMED -- do not publish", but coordination_adjusted_cbs
+will still hand back a CBS computed against a free committee. Wire real counts
+in (agent_payload.py measures them off the actual PiT payload) before believing
+any number this module prints.
 """
 from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
-from typing import Callable, Optional, Sequence
+from dataclasses import dataclass, field, replace
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -38,18 +57,32 @@ TRADING_SECONDS_PER_DAY = 23_400.0      # 6.5 hours of continuous session
 # ---------------------------------------------------------------------------
 # Model price registry
 # ---------------------------------------------------------------------------
-# Prices are USD per MILLION tokens, the unit both vendors publish in.
+# Prices are USD per MILLION tokens, the unit vendors publish in.
 #
 # SOURCES AND DATES -- update these together, never one without the other:
 #   Anthropic : https://platform.claude.com/docs/en/about-claude/pricing
-#               verified 2026-08-05 against the official docs page
-#   OpenAI    : https://platform.openai.com/docs/pricing
-#               figures below are from third-party aggregators and are NOT
-#               yet verified against the official page. Verify before citing.
+#               verified 2026-08-14. Rates below are the FIRST-PARTY API rates.
+#               Bedrock/Vertex are partner-operated and priced separately; do
+#               not reuse these figures for those.
 #
-# Cost is a MODEL-SELECTION question, not a constant: the same 29.6M-token
-# committee run costs $10.87 on GPT-5.6 Luna and $494.08 on Claude Fable 5,
-# a 45x spread. Report a curve across this table, not one number.
+# Three corrections against the previous version of this table, all of which
+# moved the CBS materially:
+#
+#   1. Cache WRITES were not modelled at all -- only reads. A cache write costs
+#      MORE than an uncached token (1.25x base at 5m TTL, 2x at 1h), so a
+#      committee that re-writes its prefix every session was being under-billed.
+#   2. `token_inflation` is gone. It existed to inflate an ASSUMED token count
+#      for the newer tokenizer. Token counts are now measured (agent_payload.py)
+#      against the deployed model, so the correction is already baked in and
+#      applying it again double-counts.
+#   3. `cache_min_tokens` added. A prefix shorter than the model's minimum
+#      silently does not cache -- no error, just cache_creation_input_tokens=0.
+#      The minimum is NOT monotonic across generations (512 on Opus 5, but 4096
+#      on Haiku 4.5), so a design that caches on one model silently pays full
+#      price on another.
+#
+# Cost is a MODEL-SELECTION question, not a constant. Report a curve across
+# this table, not one number.
 
 
 @dataclass(frozen=True)
@@ -57,41 +90,49 @@ class ModelPrice:
     name: str
     input_per_mtok: float
     output_per_mtok: float
-    cached_input_per_mtok: float      # cache hit / read rate
     source: str
     verified: str
-    token_inflation: float = 1.0      # see note below
+    cache_min_tokens: int = 1024      # prefixes below this silently do not cache
+    cache_read_mult: float = 0.10     # cache hit  ~= 0.1x base input
+    cache_write_mult: float = 1.25    # cache write = 1.25x base (5m TTL); 2.0 at 1h
+
+    @property
+    def cached_input_per_mtok(self) -> float:
+        return self.input_per_mtok * self.cache_read_mult
+
+    @property
+    def cache_write_per_mtok(self) -> float:
+        return self.input_per_mtok * self.cache_write_mult
 
     def cost(self, input_tokens: int, output_tokens: int,
-             cached_input_tokens: int = 0, batch: bool = False) -> float:
-        """Dollar cost of one usage record. Cached tokens are billed at the
-        cache-hit rate and are NOT double-counted in `input_tokens`."""
-        mult = 0.5 if batch else 1.0          # both vendors: batch = 50% off
+             cached_input_tokens: int = 0, cache_write_tokens: int = 0,
+             batch: bool = False) -> float:
+        """Dollar cost of one usage record.
+
+        The three input channels are disjoint -- a token is billed exactly
+        once, as uncached, as a cache read, or as a cache write. Double-
+        counting cached tokens inside `input_tokens` is the classic way to
+        overstate a committee's bill by ~3x.
+        """
+        mult = 0.5 if batch else 1.0          # batch API = 50% off both directions
         return mult * (
             input_tokens / 1e6 * self.input_per_mtok
             + cached_input_tokens / 1e6 * self.cached_input_per_mtok
+            + cache_write_tokens / 1e6 * self.cache_write_per_mtok
             + output_tokens / 1e6 * self.output_per_mtok
         )
 
 
-_A = "anthropic docs"
-_O = "openai (3rd-party, UNVERIFIED)"
+_A = "anthropic docs (first-party API)"
 
-# `token_inflation`: Claude 4.7 and later use a newer tokenizer that emits
-# roughly 30% more tokens for the same text than 4.6 and earlier. It is applied
-# only to ASSUMED token counts -- when an agent reports measured counts via
-# last_usage(), those are already in the right tokenizer and no factor applies.
 MODEL_PRICES: dict[str, ModelPrice] = {
-    "claude-haiku-4.5":  ModelPrice("Claude Haiku 4.5",   1.0,  5.0, 0.10, _A, "2026-08-05"),
-    "claude-sonnet-5":   ModelPrice("Claude Sonnet 5",    3.0, 15.0, 0.30, _A, "2026-08-05", 1.3),
+    "claude-haiku-4-5":  ModelPrice("Claude Haiku 4.5",  1.0,  5.0, _A, "2026-08-14", cache_min_tokens=4096),
+    "claude-sonnet-5":   ModelPrice("Claude Sonnet 5",   3.0, 15.0, _A, "2026-08-14", cache_min_tokens=1024),
     "claude-sonnet-5-intro": ModelPrice("Claude Sonnet 5 (intro, to 2026-08-31)",
-                                                          2.0, 10.0, 0.20, _A, "2026-08-05", 1.3),
-    "claude-opus-5":     ModelPrice("Claude Opus 5",      5.0, 25.0, 0.50, _A, "2026-08-05", 1.3),
-    "claude-fable-5":    ModelPrice("Claude Fable 5",    10.0, 50.0, 1.00, _A, "2026-08-05", 1.3),
-    "gpt-5.6-luna":      ModelPrice("GPT-5.6 Luna",       0.20, 1.20, 0.02, _O, "2026-08-05"),
-    "gpt-5.6-terra":     ModelPrice("GPT-5.6 Terra",      2.0, 12.0, 0.20, _O, "2026-08-05"),
-    "gpt-5.6-sol":       ModelPrice("GPT-5.6 Sol",        5.0, 30.0, 0.50, _O, "2026-08-05"),
-    "gpt-5.4":           ModelPrice("GPT-5.4",            2.50, 15.0, 0.25, _O, "2026-08-05"),
+                                                         2.0, 10.0, _A, "2026-08-14", cache_min_tokens=1024),
+    "claude-opus-4-8":   ModelPrice("Claude Opus 4.8",   5.0, 25.0, _A, "2026-08-14", cache_min_tokens=1024),
+    "claude-opus-5":     ModelPrice("Claude Opus 5",     5.0, 25.0, _A, "2026-08-14", cache_min_tokens=512),
+    "claude-fable-5":    ModelPrice("Claude Fable 5",   10.0, 50.0, _A, "2026-08-14", cache_min_tokens=512),
 }
 
 
@@ -105,12 +146,18 @@ class CoordinationCostConfig:
         price of an LLM call and a 45x spread should never be hidden in a
         default argument.
 
-    use_prompt_caching / assumed_cache_hit_rate
-        A committee re-sends the same large system prompt on every call, which
-        is exactly the case prompt caching exists for. Cache hits bill at ~10%
-        of base input. Ignoring this overstates a realistic deployment's
-        coordination bill by roughly 3x. `assumed_cache_hit_rate` is only used
-        when the agent doesn't report real cached-token counts.
+    use_prompt_caching / cache_ttl_1h
+        A committee re-sends the same system prefix to every seat, which is the
+        case prompt caching exists for: reads bill at ~0.1x base input. But
+        caching is not free and not automatic --
+          * a WRITE costs 1.25x base (5m TTL) or 2.0x (`cache_ttl_1h`), so the
+            first seat pays MORE than it would uncached;
+          * a prefix shorter than `ModelPrice.cache_min_tokens` silently does
+            not cache at all -- no error, just no discount.
+        There is deliberately no assumed hit rate here. The agent reports the
+        real read/write/uncached split (see metered_committee.py); an agent
+        that reports nothing gets no caching credit, because an unmeasured
+        discount is just a thumb on the scale.
 
     use_batch_api
         50% off both directions, 24-hour turnaround. Applies to an offline
@@ -132,9 +179,9 @@ class CoordinationCostConfig:
         intervals rather than shifting the mean -- which is itself worth
         reporting, since a slow system is a noisier system.
     """
-    model: str = "claude-sonnet-5"
+    model: str = "claude-opus-5"
     use_prompt_caching: bool = True
-    assumed_cache_hit_rate: float = 0.80
+    cache_ttl_1h: bool = False        # True -> writes cost 2.0x base instead of 1.25x
     use_batch_api: bool = False
     charge_tokens_to_portfolio: bool = True
 
@@ -143,7 +190,9 @@ class CoordinationCostConfig:
     charge_timing_noise: bool = False
 
     # Fallbacks used ONLY when an agent reports no real counts via last_usage().
-    # These are ASSUMPTIONS -- measure and replace before publishing.
+    # With agent_payload.py wired in, nothing should reach these -- they exist
+    # so an unmetered agent fails loudly in report() rather than silently
+    # costing $0.00.
     assumed_tokens_per_llm_call_in: int = 4_000
     assumed_tokens_per_llm_call_out: int = 800
     assumed_seconds_per_llm_call: float = 8.0
@@ -158,6 +207,13 @@ class CoordinationCostConfig:
             )
         return MODEL_PRICES[self.model]
 
+    def effective_price(self) -> ModelPrice:
+        """Price with the configured cache TTL applied to the write rate."""
+        p = self.price
+        if self.cache_ttl_1h:
+            return replace(p, cache_write_mult=2.0)
+        return p
+
 
 # ===========================================================================
 # A. The meter
@@ -168,19 +224,23 @@ class DecisionRecord:
     as_of: pd.Timestamp
     llm_calls: int = 0
     input_tokens: int = 0            # UNCACHED input only
-    cached_input_tokens: int = 0     # billed at the cache-hit rate, ~10% of base
+    cached_input_tokens: int = 0     # cache READS, ~0.1x base
+    cache_write_tokens: int = 0      # cache WRITES, 1.25x base (2.0x at 1h TTL)
     output_tokens: int = 0
     messages: int = 0
     latency_seconds: float = 0.0
     n_orders: int = 0
     measured: bool = False           # True if the agent reported real counts
+    failed: bool = False             # agent raised; latency still charged
 
     def token_cost_usd(self, cfg: CoordinationCostConfig) -> float:
-        return cfg.price.cost(self.input_tokens, self.output_tokens,
-                              self.cached_input_tokens, batch=cfg.use_batch_api)
+        return cfg.effective_price().cost(
+            self.input_tokens, self.output_tokens,
+            self.cached_input_tokens, self.cache_write_tokens,
+            batch=cfg.use_batch_api)
 
     def total_input_tokens(self) -> int:
-        return self.input_tokens + self.cached_input_tokens
+        return self.input_tokens + self.cached_input_tokens + self.cache_write_tokens
 
 
 class CoordinationMeter:
@@ -220,7 +280,18 @@ class CoordinationMeter:
 
     def __call__(self, decision_snapshots, positions, cash, as_of):
         t0 = time.perf_counter()
-        orders = self.agent(decision_snapshots, positions, cash, as_of)
+        failed = False
+        try:
+            orders = self.agent(decision_snapshots, positions, cash, as_of)
+        except Exception:
+            # A committee that burns 90 seconds and then throws still consumed
+            # 90 seconds and every token it sent. Letting the exception skip
+            # the record made failures free, which under-charges exactly the
+            # slowest, most expensive decisions. Record, then re-raise so
+            # runner.run_episode still treats the day as no-trade.
+            elapsed = time.perf_counter() - t0
+            self._record(as_of, {}, elapsed, 0, failed=True)
+            raise
         elapsed = time.perf_counter() - t0
 
         usage = {}
@@ -230,42 +301,49 @@ class CoordinationMeter:
             except Exception:
                 usage = {}
 
+        self._record(as_of, usage, elapsed, len(orders or []), failed=failed)
+        return orders or []
+
+    def _record(self, as_of, usage, elapsed, n_orders, failed=False):
         cfg = self.cfg
         calls = int(usage.get("llm_calls", 0))
         measured = bool(usage)
         if not calls and self.n_agents > 1:
             calls = self.n_agents              # assume one call per agent per decision
 
-        if "input_tokens" in usage or "cached_input_tokens" in usage:
-            # Real counts. Already in the deployed model's tokenizer, so no
-            # inflation factor -- applying one here would double-count.
+        if measured and ("input_tokens" in usage or "cached_input_tokens" in usage):
+            # Real counts, already in the deployed model's tokenizer.
             uncached = int(usage.get("input_tokens", 0))
             cached = int(usage.get("cached_input_tokens", 0))
+            written = int(usage.get("cache_write_tokens", 0))
             out_tok = int(usage.get("output_tokens", 0))
         else:
-            # Assumed counts. Scale by the model's tokenizer factor, then split
-            # into cached/uncached at the assumed hit rate.
-            infl = cfg.price.token_inflation
-            total_in = int(calls * cfg.assumed_tokens_per_llm_call_in * infl)
-            out_tok = int(calls * cfg.assumed_tokens_per_llm_call_out * infl)
-            hit = cfg.assumed_cache_hit_rate if cfg.use_prompt_caching else 0.0
-            cached = int(total_in * hit)
-            uncached = total_in - cached
+            # Assumed counts -- no caching credit is given here on purpose.
+            # The old code assumed an 80% hit rate against an unmeasured
+            # prefix, which is the single most flattering assumption available
+            # and produced a near-free committee. If you have not measured the
+            # split, you have not earned the discount.
+            uncached = int(calls * cfg.assumed_tokens_per_llm_call_in)
+            out_tok = int(calls * cfg.assumed_tokens_per_llm_call_out)
+            cached = written = 0
 
-        rec = DecisionRecord(
+        self.records.append(DecisionRecord(
             as_of=as_of,
             llm_calls=calls,
             input_tokens=uncached,
             cached_input_tokens=cached,
+            cache_write_tokens=written,
             output_tokens=out_tok,
             messages=int(usage.get("messages", max(self.n_agents - 1, 0))),
-            latency_seconds=max(elapsed, calls * cfg.assumed_seconds_per_llm_call)
-            if calls else elapsed,
-            n_orders=len(orders or []),
+            # An agent that models its own latency (no real LLM behind it)
+            # reports it explicitly; otherwise fall back to measured wall-clock
+            # floored at the assumed per-call cost.
+            latency_seconds=float(usage["latency_seconds"]) if "latency_seconds" in usage
+            else (max(elapsed, calls * cfg.assumed_seconds_per_llm_call) if calls else elapsed),
+            n_orders=n_orders,
             measured=measured,
-        )
-        self.records.append(rec)
-        return orders or []
+            failed=failed,
+        ))
 
     # --- reporting ----------------------------------------------------------
     def total_token_cost_usd(self) -> float:
@@ -283,22 +361,29 @@ class CoordinationMeter:
         if not self.records:
             return f"{self.name}: no decisions metered."
         f = self.frame()
-        p = self.cfg.price
-        provenance = ("MEASURED from the agent" if f["measured"].any()
-                      else "ASSUMED -- not measured, do not publish")
+        p = self.cfg.effective_price()
+        provenance = (getattr(self, "token_provenance", None)
+                      or ("MEASURED from the agent" if f["measured"].any()
+                          else "ASSUMED -- not measured, do not publish"))
+        n_fail = int(f["failed"].sum())
         return "\n".join([
             f"=== Coordination cost: {self.name} ===",
             f"  model                : {p.name}  (${p.input_per_mtok}/${p.output_per_mtok} "
             f"per MTok, {p.source}, verified {p.verified})",
+            f"  cache rates          : read ${p.cached_input_per_mtok:.2f} / "
+            f"write ${p.cache_write_per_mtok:.2f} per MTok "
+            f"(min cacheable prefix {p.cache_min_tokens:,} tok)",
             f"  billing              : caching {'on' if self.cfg.use_prompt_caching else 'off'}, "
-            f"batch {'on' if self.cfg.use_batch_api else 'off'}",
+            f"batch {'on' if self.cfg.use_batch_api else 'off'}, "
+            f"TTL {'1h' if self.cfg.cache_ttl_1h else '5m'}",
             f"  token counts         : {provenance}",
-            f"  decisions            : {len(f):,}",
+            f"  decisions            : {len(f):,}" + (f"  ({n_fail} failed)" if n_fail else ""),
             f"  LLM calls            : {int(f['llm_calls'].sum()):,} "
             f"({f['llm_calls'].mean():.1f} per decision)",
-            f"  tokens               : {int(f['input_tokens'].sum()):,} uncached in / "
-            f"{int(f['cached_input_tokens'].sum()):,} cached in / "
-            f"{int(f['output_tokens'].sum()):,} out",
+            f"  input tokens         : {int(f['input_tokens'].sum()):,} uncached / "
+            f"{int(f['cached_input_tokens'].sum()):,} cache-read / "
+            f"{int(f['cache_write_tokens'].sum()):,} cache-write",
+            f"  output tokens        : {int(f['output_tokens'].sum()):,}",
             f"  inter-agent messages : {int(f['messages'].sum()):,}",
             f"  token cost           : ${self.total_token_cost_usd():,.2f}",
             f"  mean decision latency: {self.mean_latency_seconds():.2f} s",
@@ -315,19 +400,33 @@ class CoordinationMeter:
         if not self.records:
             return pd.DataFrame()
         f = self.frame()
-        unc, cac, out = (int(f["input_tokens"].sum()),
-                         int(f["cached_input_tokens"].sum()),
-                         int(f["output_tokens"].sum()))
+        unc, cac, wrt, out = (int(f["input_tokens"].sum()),
+                              int(f["cached_input_tokens"].sum()),
+                              int(f["cache_write_tokens"].sum()),
+                              int(f["output_tokens"].sum()))
+        # Token volume was measured against ONE model's tokenizer. Repricing it
+        # on another model is a price swap, not a re-tokenization -- models in
+        # different tokenizer families would emit different counts for the same
+        # text. Flagged rather than silently corrected, because the correction
+        # requires re-measuring, not a multiplier.
         rows = []
         for key in (models or MODEL_PRICES):
             mp = MODEL_PRICES[key]
             rows.append({
                 "model": mp.name,
                 "usd_per_mtok": f"${mp.input_per_mtok:g}/${mp.output_per_mtok:g}",
-                "cost_usd": round(mp.cost(unc, out, cac, batch=batch), 2),
+                "cost_usd": round(mp.cost(unc, out, cac, wrt, batch=batch), 2),
+                "prefix_caches": (
+                    "?" if not self._prefix_tokens
+                    else ("yes" if self._prefix_tokens >= mp.cache_min_tokens
+                          else f"NO ({self._prefix_tokens}<{mp.cache_min_tokens})")),
                 "source": mp.source,
             })
         return (pd.DataFrame(rows).sort_values("cost_usd").reset_index(drop=True))
+
+    # Set by the metered agent so cost_across_models can tell you whether the
+    # cacheable prefix actually clears each model's minimum.
+    _prefix_tokens: int = 0
 
 
 # ===========================================================================
@@ -390,10 +489,27 @@ def apply_coordination_costs(portfolio_values: pd.Series,
     if cfg.charge_tokens_to_portfolio and meter.records:
         costs = pd.Series([r.token_cost_usd(cfg) for r in meter.records],
                           index=pd.to_datetime([r.as_of for r in meter.records]).normalize())
-        by_day = costs.groupby(level=0).sum()
-        running = by_day.reindex(pv.index.normalize(), fill_value=0.0).cumsum()
-        running.index = pv.index
+        by_day = costs.groupby(level=0).sum().sort_index()
+
+        # Charge every decision whose timestamp falls at or before each mark,
+        # rather than reindexing onto the mark dates. The old reindex silently
+        # DROPPED any decision made on a day with no portfolio value -- which
+        # run_episode produces whenever no ticker printed a close (halts,
+        # holiday mismatches). Those decisions still cost money.
+        pv_days = pv.index.normalize()
+        window = by_day[(by_day.index >= pv_days[0]) & (by_day.index <= pv_days[-1])]
+        cum = window.cumsum()
+        # asof: cumulative spend as of each mark, carrying forward between marks
+        running = pd.Series(
+            cum.reindex(cum.index.union(pv_days)).ffill().reindex(pv_days).fillna(0.0).to_numpy(),
+            index=pv.index)
+
+        # Decisions outside the mark window are still real spend; charge them
+        # at the end rather than losing them.
+        stray = float(by_day.sum() - window.sum())
         adjusted = adjusted - running
+        if stray:
+            adjusted.iloc[-1] -= stray
 
     return adjusted
 
@@ -421,10 +537,20 @@ class CoordinationCBS:
                     f"(advantage {self.advantage_trading_costs_only:+,.0f} -> "
                     f"{self.advantage_with_coordination:+,.0f})")
         if a is not None and b is not None:
-            return (f"CBS falls from {a:.0f} to {b:.0f} bps once coordination "
-                    f"is billed -- a {100*(1-b/a):.0f}% reduction in headroom"
-                    if a > 0 else "coordination pays")
-        return "coordination survives the full tested cost grid"
+            if a > 0:
+                return (f"CBS falls from {a:.0f} to {b:.0f} bps once coordination "
+                        f"is billed -- a {100*(1-b/a):.0f}% reduction in headroom")
+            # a == 0 means the edge did not survive even zero added trading
+            # cost. The old code reported "coordination pays" here, which is
+            # the opposite of what a zero CBS means.
+            return ("no CBS headroom even before coordination is billed "
+                    "(edge vanishes at 0 bps added cost)")
+        if a is None and b is None:
+            return "coordination survives the full tested cost grid"
+        if b is None:
+            return f"CBS >{self.cbs_bps_trading_only or 0:.0f} bps and survives the full grid once billed"
+        return (f"edge survives the full grid on trading costs alone, but only "
+                f"{b:.0f} bps once coordination is billed")
 
 
 def coordination_adjusted_cbs(
@@ -445,33 +571,37 @@ def coordination_adjusted_cbs(
     from comparison import _episode_adjusted_pnl          # your existing function
     cfg = cfg or system_meter.cfg
 
-    def side_pnl(episodes, meter, bps):
+    def coordination_bill(episodes, meter) -> float:
+        """Total coordination bill in dollars. Independent of the fee sweep, so
+        it is computed ONCE rather than rebuilt at every bps step -- the old
+        version re-ran a full pandas rebuild per episode per bps, 200x more
+        work than needed for an identical answer."""
+        if meter is None or not meter.records:
+            return 0.0
         total = 0.0
         for ep in episodes:
-            base = _episode_adjusted_pnl(ep, bps)
-            if meter is None or not meter.records:
-                total += base
+            raw = pd.Series(ep.portfolio_values).sort_index()
+            if len(raw) < 2:
                 continue
             adj = apply_coordination_costs(ep.portfolio_values, meter, cfg)
-            raw = pd.Series(ep.portfolio_values).sort_index()
-            # difference between adjusted and raw final value = the coordination bill
-            bill = float(raw.iloc[-1] - adj.iloc[-1]) if len(raw) > 1 else 0.0
-            total += base - bill
+            total += float(raw.iloc[-1] - adj.iloc[-1])
         return total
 
-    adv_trading = (side_pnl(system_episodes, None, 0.0)
-                   - side_pnl(baseline_episodes, None, 0.0))
-    adv_full = (side_pnl(system_episodes, system_meter, 0.0)
-                - side_pnl(baseline_episodes, baseline_meter, 0.0))
+    sys_bill = coordination_bill(system_episodes, system_meter)
+    base_bill = coordination_bill(baseline_episodes, baseline_meter)
 
-    def sweep(meter_sys, meter_base):
+    def side_pnl(episodes, bill, bps):
+        return sum(_episode_adjusted_pnl(ep, bps) for ep in episodes) - bill
+
+    adv_trading = side_pnl(system_episodes, 0.0, 0.0) - side_pnl(baseline_episodes, 0.0, 0.0)
+    adv_full = side_pnl(system_episodes, sys_bill, 0.0) - side_pnl(baseline_episodes, base_bill, 0.0)
+
+    def sweep(bs, bb):
         bps = 0.0
-        if (side_pnl(system_episodes, meter_sys, 0.0)
-                - side_pnl(baseline_episodes, meter_base, 0.0)) <= 0:
+        if side_pnl(system_episodes, bs, 0.0) - side_pnl(baseline_episodes, bb, 0.0) <= 0:
             return 0.0
         while bps <= max_bps:
-            if (side_pnl(system_episodes, meter_sys, bps)
-                    - side_pnl(baseline_episodes, meter_base, bps)) <= 0:
+            if side_pnl(system_episodes, bs, bps) - side_pnl(baseline_episodes, bb, bps) <= 0:
                 return bps
             bps += step_bps
         return None
@@ -480,8 +610,8 @@ def coordination_adjusted_cbs(
         system=system_name, baseline=baseline_name,
         advantage_trading_costs_only=adv_trading,
         advantage_with_coordination=adv_full,
-        cbs_bps_trading_only=sweep(None, None),
-        cbs_bps_with_coordination=sweep(system_meter, baseline_meter),
+        cbs_bps_trading_only=sweep(0.0, 0.0),
+        cbs_bps_with_coordination=sweep(sys_bill, base_bill),
         token_cost_usd=system_meter.total_token_cost_usd(),
         mean_latency_seconds=system_meter.mean_latency_seconds(),
         edge_retained=alpha_decay_factor(system_meter.mean_latency_seconds(), cfg),
