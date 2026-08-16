@@ -16,11 +16,22 @@ Also provides the two other Data Preparation phase pieces:
   - a non-overlapping episode window generator with purge gaps, for
     rolling-window evaluation.
 
+Plus three datasets pulled live from Alpaca's Market Data API for the
+Execution Replay phase (order sequencing, fill mechanics, bid/ask spreads --
+none of which the daily FNSPID bars below can support): intraday bars,
+NBBO quotes, and corporate actions. Coverage is empirically bounded to
+~2016 onward; see ALPACA_HISTORY_START.
+
 Raw sources (already downloaded):
   ~/full_history.zip                    FNSPID prices, one CSV per ticker
   ~/nasdaq_exteral_data.csv             FNSPID news, ~9GB, one row per article
   ~/financial-statement-data-sets/*.zip SEC EDGAR quarterly financial
                                          statement data sets (sub/num/tag/pre)
+
+Raw sources (fetched live, need APCA_API_KEY_ID / APCA_API_SECRET_KEY in .env):
+  Alpaca Market Data API                intraday bars, NBBO quotes, corporate
+                                         actions -- see build_intraday_bars,
+                                         build_quotes, build_corporate_actions
 """
 
 from __future__ import annotations
@@ -61,6 +72,90 @@ MARKET_CLOSE_UTC_HOUR = 20  # ~4pm ET
 
 
 # ---------------------------------------------------------------------------
+# Official evaluation scope: which stocks, which episodes
+# ---------------------------------------------------------------------------
+# Neither of these was decided anywhere before -- every prior script in this
+# repo (demo.py, validate.py) just picked its own convenient ticker/date
+# range for its own testing purpose. These are the actual decisions,
+# verified against the built data rather than assumed:
+
+# 20 large-cap, highly liquid US equities. Picked over the full 7,693-ticker
+# FNSPID universe for three concrete reasons: (1) household-recognizable
+# names a reader can sanity-check results against, (2) high liquidity, which
+# matters directly for the CBS metric (cbs.py) -- coordination is only
+# economically viable on narrow-spread instruments, and narrow spreads
+# correlate with liquidity; (3) guaranteed Alpaca intraday/quote coverage
+# for the post-2016 portion of the episode range below.
+#
+# Known limitation, stated plainly rather than hidden: this is a fixed list,
+# not a point-in-time index membership snapshot. Nguyen & Pham 2026
+# (arXiv:2603.27539) name exactly this ("point-in-time universe") as one of
+# their five minimum evaluation standards -- a proper fix means sourcing
+# historical index-constituent data (e.g. the Sharadar bundle named in the
+# proposal), which this pipeline does not have. Using a fixed list of
+# still-listed large-caps is survivorship-biased in the standard way (it
+# excludes companies that were large-cap and later failed/were acquired/were
+# delisted). Flagged as a real gap, not silently accepted.
+#
+# Every ticker below was verified two ways, not just "exists": (1) price
+# history actually spans the full EPISODE_RANGE_START-EPISODE_RANGE_END
+# window below with no early cutoff, and (2) ticker_to_cik resolves, so
+# fundamentals aren't silently empty. This caught real problems on the
+# first pass -- GOOGL, FB, PG, HD, MA, and BAC all looked fine by ticker
+# existence alone but their raw FNSPID price history actually stops dead in
+# 2020 (verified against the raw zip directly, not a processing bug), and FB
+# never resolves a CIK at all. Swapped for the closest verified-complete
+# large-cap peer in each case: GOOGL->GOOG (same company, other share
+# class, full history), FB->INTC, PG->CL, HD->LOW, MA->AXP, BAC->WFC.
+EVALUATION_TICKERS = [
+    "AAPL", "MSFT", "GOOG", "AMZN", "INTC", "NVDA", "TSLA", "JPM", "V", "JNJ",
+    "WMT", "CL", "XOM", "ABBV", "LOW", "AXP", "DIS", "WFC", "KO", "PFE",
+]
+
+# SPY and GLD are the SPDR S&P 500 / SPDR Gold Shares named directly in the
+# proposal. MCHI (the proposal's named China ETF) has the same problem as
+# the swapped equities above -- its FNSPID price history stops at
+# 2020-07-02, verified directly -- so FXI (iShares China Large-Cap) is used
+# instead as the closest verified-complete China-exposure ETF. Both FXI and
+# MCHI fail ticker_to_cik (cik=None) -- unlike the operating companies
+# above, that's expected and not a gap: these are ETF trusts, not treated
+# as filers this crosswalk resolves, and benchmarks are only ever used for
+# passive-return comparison, never for the fundamentals-derived ratios that
+# CIK resolution would feed.
+BENCHMARK_TICKERS = ["SPY", "GLD", "FXI"]
+
+# Episode window length and purge gap: 90 days / 14 days. Not a new choice --
+# this is what demo.py and both validate.py episode checks already used
+# consistently, just never declared as an official constant until now.
+EPISODE_WINDOW_LEN = pd.Timedelta(days=90)
+EPISODE_PURGE_GAP = pd.Timedelta(days=14)
+
+# Episode range: 2010-01-01 to 2024-01-01. Bounded on both ends by verified
+# data coverage, not picked arbitrarily:
+#   start -- SEC EDGAR's earliest quarterly archive is 2009q1 (verified:
+#            ls ~/financial-statement-data-sets/*.zip). Starting exactly at
+#            2009q1 would mean the earliest episodes see only one quarter of
+#            fundamentals history; 2010-01-01 gives a full year of buffer so
+#            snapshot_as_of's fundamentals ratios aren't running on
+#            single-quarter data for the first several episodes.
+#   end   -- verified news coverage extends through 2024 (validate.py's own
+#            coverage check requires max(years) >= 2023; the actual built
+#            data reaches into 2024).
+# Consequence, stated directly: this excludes the 2008 GFC. Fundamentals
+# data doesn't exist in this pipeline before 2009q1, so an episode
+# overlapping 2008 would hand the agent a snapshot with real prices/news but
+# an empty fundamentals table and three None-valued ratios out of
+# derived_features -- a degraded, inconsistent bundle compared to every
+# other episode. The regime *labeling* itself is unaffected (label_regimes
+# runs on SPY back to 1993 and already correctly flags 2008 as crisis, shown
+# earlier), but the multi-source snapshot an agent would actually receive
+# for that period is incomplete, so 2008 is excluded from the official
+# episode set until fundamentals coverage before 2009 is sourced separately.
+EPISODE_RANGE_START = pd.Timestamp("2010-01-01", tz="UTC")
+EPISODE_RANGE_END = pd.Timestamp("2024-01-01", tz="UTC")
+
+
+# ---------------------------------------------------------------------------
 # Prices: FNSPID full_history.zip -> partitioned Parquet
 # ---------------------------------------------------------------------------
 
@@ -82,7 +177,13 @@ def build_prices(limit_tickers: int | None = None) -> None:
 
         n_ok, n_bad = 0, 0
         for i, member in enumerate(members, 1):
-            ticker = Path(member).stem
+            # Uppercased: the raw zip's filenames are inconsistently cased
+            # (mostly upper, some lower, e.g. "nvda.csv"), but every other
+            # ticker lookup in this codebase assumes uppercase (ticker_to_cik
+            # does .upper(), the entity map is uppercase). Left as-is, a
+            # lookup for "NVDA" would silently return zero rows instead of
+            # an error -- normalizing here is what prevents that.
+            ticker = Path(member).stem.upper()
             try:
                 with zf.open(member) as f:
                     df = pd.read_csv(f)
@@ -359,10 +460,27 @@ def build_news_entity_backfill() -> None:
         found = set(kp.extract_keywords(title))
         return found.pop() if len(found) == 1 else None
 
-    total_tagged, total_matched, total_rows = 0, 0, 0
+    total_tagged, total_matched, total_rows, total_deduped = 0, 0, 0, 0
     for ydir in year_dirs:
         files = list(ydir.glob("*.parquet"))
         df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+        # A year directory can end up holding both an already-backfilled
+        # file and a fresh, not-yet-backfilled set of files in it -- e.g.
+        # build_news got re-run after backfill had already completed once,
+        # without a matching backfill re-run afterward, since build_news
+        # doesn't clear its output directory first. Concatenating both
+        # copies would silently double every duplicated article. Dedupe on
+        # url (the most reliable unique identifier for one article -- more
+        # reliable than title, which is a plain string) before anything
+        # else, and drop any stale entity_source column so it gets
+        # recomputed fresh for every row below, not left half-populated
+        # from whichever copy happened to have it already.
+        before = len(df)
+        df = df.drop_duplicates(subset=["url"], keep="first").reset_index(drop=True)
+        total_deduped += before - len(df)
+        if "entity_source" in df.columns:
+            df = df.drop(columns=["entity_source"])
 
         tagged_mask = df["entity"].notna()
         df["entity_source"] = pd.Series(pd.NA, index=df.index, dtype="object")
@@ -383,11 +501,12 @@ def build_news_entity_backfill() -> None:
         total_tagged += int(tagged_mask.sum())
         total_matched += len(matched_idx)
         total_rows += len(df)
-        log.info("entity backfill: %s -> %d tagged, %d recovered via title match, %d still untagged",
-                 ydir.name, int(tagged_mask.sum()), len(matched_idx),
+        log.info("entity backfill: %s -> %d duplicate rows dropped, %d tagged, %d recovered via title match, %d still untagged",
+                 ydir.name, before - len(df), int(tagged_mask.sum()), len(matched_idx),
                  len(df) - int(tagged_mask.sum()) - len(matched_idx))
 
-    log.info("entity backfill: done. %d/%d rows tagged (%d original + %d recovered)",
+    log.info("entity backfill: done. %d duplicate rows dropped total. %d/%d rows tagged (%d original + %d recovered)",
+              total_deduped,
               total_tagged + total_matched, total_rows, total_tagged, total_matched)
 
 
@@ -480,6 +599,244 @@ def load_fundamentals(entities: list[int] | None = None, quarters: list[str] | N
     # Per-file reads still push the entity filter down to row-group pruning.
     filters = [("entity", "in", entities)] if entities else None
     return pd.concat([pd.read_parquet(p, filters=filters) for p in paths], ignore_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Intraday bars, quotes, corporate actions: Alpaca Market Data API
+# ---------------------------------------------------------------------------
+# FNSPID's daily bars (build_prices, above) can't support the Execution
+# Replay phase: order sequencing and fill mechanics need sub-daily price
+# movement, and neither FNSPID nor SEC EDGAR carry bid/ask quotes at all.
+# Alpaca's Market Data API fills both gaps -- but only from ~2016 onward.
+# Verified empirically against this account's SIP (full consolidated tape,
+# not just IEX) feed: 1-minute bars and quotes for AAPL are empty on
+# 2015-11-02, present by 2016-01-05. Episodes before that boundary --
+# including the 2008 GFC window the regime engine already validates
+# against -- can't get intraday-fidelity replay from this source and fall
+# back to the daily-bar approximation.
+#
+# These three datasets are deliberately kept separate from build_prices'
+# PRICES_DIR: they serve the Execution Replay phase (fills, spreads, fees),
+# not the agent's own decision-time snapshot, which is what snapshot_as_of
+# bundles for the daily-granularity PiT view.
+
+ALPACA_DATA_URL = "https://data.alpaca.markets"
+ALPACA_HISTORY_START = pd.Timestamp("2016-01-01", tz="UTC")  # empirical floor, see above
+
+INTRADAY_DIR = PROCESSED_DIR / "intraday_bars"
+QUOTES_DIR = PROCESSED_DIR / "quotes"
+CORP_ACTIONS_DIR = PROCESSED_DIR / "corporate_actions"
+
+_ALPACA_TIMEFRAME_MINUTES = {"1Min": 1, "5Min": 5, "15Min": 15, "1Hour": 60}
+CORP_ACTION_TYPES = "forward_split,reverse_split,cash_dividend"
+
+
+def _alpaca_headers() -> dict:
+    import os
+
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    key, secret = os.environ.get("APCA_API_KEY_ID"), os.environ.get("APCA_API_SECRET_KEY")
+    if not key or not secret:
+        raise RuntimeError("APCA_API_KEY_ID / APCA_API_SECRET_KEY not set -- put them in .env")
+    return {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+
+
+def _alpaca_get_all_pages(path: str, params: dict) -> list[dict]:
+    """GET one Alpaca Market Data endpoint, following `next_page_token`
+    until exhausted -- bars/quotes paginate at up to 10k records/page, and a
+    multi-year pull needs many pages, so this is the one place pagination
+    logic lives rather than repeating it per dataset."""
+    import time
+
+    import requests
+
+    headers = _alpaca_headers()
+    pages = []
+    page_token = None
+    while True:
+        req_params = dict(params)
+        if page_token:
+            req_params["page_token"] = page_token
+        resp = requests.get(f"{ALPACA_DATA_URL}{path}", headers=headers, params=req_params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        pages.append(data)
+        page_token = data.get("next_page_token")
+        if not page_token:
+            break
+        time.sleep(0.05)  # stay well under the per-minute rate limit
+    return pages
+
+
+def build_intraday_bars(tickers: list[str], start: str | pd.Timestamp, end: str | pd.Timestamp,
+                         timeframe: str = "1Min", feed: str = "sip") -> None:
+    """Pull historical OHLCV bars from Alpaca for `tickers` into
+    data/processed/intraday_bars, partitioned by ticker. `available_at` =
+    bar start time + one bar interval -- a bar isn't knowable until the
+    interval it covers has actually elapsed, the same reasoning build_prices
+    uses for its market-close offset on daily bars, just at bar
+    granularity instead of a full trading day.
+
+    Coverage is empirically bounded at ALPACA_HISTORY_START (~2016);
+    requesting an earlier start just returns no rows for that stretch, it
+    doesn't raise -- callers evaluating pre-2016 episodes need to know that
+    silently-empty is expected, not a bug."""
+    start, end = pd.Timestamp(start, tz="UTC"), pd.Timestamp(end, tz="UTC")
+    INTRADAY_DIR.mkdir(parents=True, exist_ok=True)
+    bar_len = pd.Timedelta(minutes=_ALPACA_TIMEFRAME_MINUTES[timeframe])
+
+    for ticker in tickers:
+        pages = _alpaca_get_all_pages(
+            f"/v2/stocks/{ticker}/bars",
+            {"timeframe": timeframe, "start": start.isoformat(), "end": end.isoformat(),
+             "feed": feed, "limit": 10000},
+        )
+        bars = [b for page in pages for b in (page.get("bars") or [])]
+        if not bars:
+            log.warning("intraday bars: no data for %s in requested range", ticker)
+            continue
+        df = pd.DataFrame(bars).rename(columns={
+            "t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close",
+            "v": "volume", "n": "trade_count", "vw": "vwap",
+        })
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, format="ISO8601")
+        df["available_at"] = df["timestamp"] + bar_len
+        df["entity"] = ticker
+
+        out_dir = INTRADAY_DIR / f"entity={ticker}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(out_dir / "data.parquet", index=False)
+        log.info("intraday bars: %s -> %d bars", ticker, len(df))
+
+
+def load_intraday_bars(entities: list[str] | None = None) -> pd.DataFrame:
+    if not INTRADAY_DIR.exists():
+        raise FileNotFoundError(f"no processed intraday bars at {INTRADAY_DIR}, run build-intraday-bars first")
+    if entities:
+        paths = [INTRADAY_DIR / f"entity={e}" / "data.parquet" for e in entities]
+        paths = [p for p in paths if p.exists()]
+    else:
+        paths = sorted(INTRADAY_DIR.glob("entity=*/data.parquet"))
+    if not paths:
+        return pd.DataFrame()
+    return pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
+
+
+def build_quotes(tickers: list[str], start: str | pd.Timestamp, end: str | pd.Timestamp,
+                  feed: str = "sip") -> None:
+    """Pull historical NBBO quotes (bid/ask) from Alpaca for `tickers` into
+    data/processed/quotes. `available_at` = the quote's own timestamp --
+    unlike a bar, a quote is knowable the instant it prints, no interval
+    offset needed (same reasoning as news' published_at).
+
+    This is the one dataset in the whole pipeline that carries an actual
+    bid/ask spread -- neither FNSPID nor SEC EDGAR have one at all. Tick
+    quote volume is large for liquid names (tens of thousands of quotes per
+    ticker per day); pulling a wide ticker universe over years of history
+    at full tick resolution is a real storage/time cost, not just an API
+    call count -- worth resampling to a coarser snapshot (e.g. quote-at-each-
+    bar-close) before this feeds the replay engine, rather than keeping raw
+    ticks by default."""
+    start, end = pd.Timestamp(start, tz="UTC"), pd.Timestamp(end, tz="UTC")
+    QUOTES_DIR.mkdir(parents=True, exist_ok=True)
+
+    for ticker in tickers:
+        pages = _alpaca_get_all_pages(
+            f"/v2/stocks/{ticker}/quotes",
+            {"start": start.isoformat(), "end": end.isoformat(), "feed": feed, "limit": 10000},
+        )
+        quotes = [q for page in pages for q in (page.get("quotes") or [])]
+        if not quotes:
+            log.warning("quotes: no data for %s in requested range", ticker)
+            continue
+        df = pd.DataFrame(quotes).rename(columns={
+            "t": "timestamp", "bp": "bid_price", "bs": "bid_size",
+            "ap": "ask_price", "as": "ask_size", "bx": "bid_exchange", "ax": "ask_exchange",
+        })
+        # Quote timestamps come back at inconsistent sub-second precision --
+        # some carry nanosecond fractions, some don't -- which breaks
+        # pandas' single-format auto-detection; ISO8601 mode handles both.
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, format="ISO8601")
+        df["available_at"] = df["timestamp"]
+        df["entity"] = ticker
+        df["spread"] = df["ask_price"] - df["bid_price"]
+        df = df[["entity", "timestamp", "available_at", "bid_price", "bid_size",
+                 "ask_price", "ask_size", "spread", "bid_exchange", "ask_exchange"]]
+
+        out_dir = QUOTES_DIR / f"entity={ticker}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(out_dir / "data.parquet", index=False)
+        log.info("quotes: %s -> %d quotes", ticker, len(df))
+
+
+def load_quotes(entities: list[str] | None = None) -> pd.DataFrame:
+    if not QUOTES_DIR.exists():
+        raise FileNotFoundError(f"no processed quotes at {QUOTES_DIR}, run build-quotes first")
+    if entities:
+        paths = [QUOTES_DIR / f"entity={e}" / "data.parquet" for e in entities]
+        paths = [p for p in paths if p.exists()]
+    else:
+        paths = sorted(QUOTES_DIR.glob("entity=*/data.parquet"))
+    if not paths:
+        return pd.DataFrame()
+    return pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
+
+
+def build_corporate_actions(tickers: list[str], start: str | pd.Timestamp,
+                             end: str | pd.Timestamp) -> None:
+    """Pull splits and cash dividends from Alpaca's corporate-actions API
+    into data/processed/corporate_actions. `available_at` = ex_date at
+    midnight UTC -- the API doesn't expose a declaration/announcement date,
+    only ex/record/payable/process dates, so ex_date is the latest-known-
+    safe proxy: the real announcement happened at or before ex_date, so
+    using ex_date as available_at can only be overly conservative (treating
+    something as not-yet-knowable when it technically was, slightly
+    earlier), never leak something too early. Same safe-direction tradeoff
+    build_fundamentals makes falling back from `accepted` to `filed`.
+
+    Verified against AAPL's real 2020-08-31 4:1 split and its quarterly
+    dividends for 2020 -- both come back with correct real-world dates and
+    ratios, not FNSPID's retroactively-adjusted price series."""
+    start, end = pd.Timestamp(start, tz="UTC"), pd.Timestamp(end, tz="UTC")
+    CORP_ACTIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+    pages = _alpaca_get_all_pages(
+        "/v1beta1/corporate-actions",
+        {"symbols": ",".join(tickers), "start": start.date().isoformat(),
+         "end": end.date().isoformat(), "types": CORP_ACTION_TYPES, "limit": 1000},
+    )
+    rows = []
+    for page in pages:
+        actions = page.get("corporate_actions", {})
+        for div in actions.get("cash_dividends") or []:
+            rows.append({"entity": div["symbol"], "action_type": "cash_dividend",
+                         "ex_date": div["ex_date"], "rate": div["rate"], "split_ratio": None})
+        for split in (actions.get("forward_splits") or []) + (actions.get("reverse_splits") or []):
+            rows.append({"entity": split["symbol"], "action_type": "split",
+                         "ex_date": split["ex_date"], "rate": None,
+                         "split_ratio": split["new_rate"] / split["old_rate"]})
+    if not rows:
+        log.warning("corporate actions: no data for requested tickers/range")
+        return
+
+    df = pd.DataFrame(rows)
+    df["ex_date"] = pd.to_datetime(df["ex_date"], utc=True)
+    df["available_at"] = df["ex_date"]
+    df.to_parquet(CORP_ACTIONS_DIR / "data.parquet", index=False)
+    log.info("corporate actions: %d actions written (%d dividends, %d splits)", len(df),
+              int((df["action_type"] == "cash_dividend").sum()), int((df["action_type"] == "split").sum()))
+
+
+def load_corporate_actions(entities: list[str] | None = None) -> pd.DataFrame:
+    path = CORP_ACTIONS_DIR / "data.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"no processed corporate actions at {CORP_ACTIONS_DIR}, run build-corporate-actions first")
+    df = pd.read_parquet(path)
+    if entities:
+        df = df[df["entity"].isin(entities)]
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +996,28 @@ class PointInTimeStore:
         df = load_fundamentals(entities, quarters)
         return self._enforce_and_log("fundamentals", as_of, df)
 
+    def bars_as_of(self, as_of: pd.Timestamp, entities: list[str] | None = None) -> pd.DataFrame:
+        """Intraday bars (Alpaca) for the Execution Replay phase -- same
+        enforcement as prices_as_of, just at bar granularity. Empty for any
+        `as_of` before ALPACA_HISTORY_START regardless of cutoff, since the
+        underlying data doesn't exist that far back (see build_intraday_bars)."""
+        df = load_intraday_bars(entities)
+        return self._enforce_and_log("intraday_bars", as_of, df)
+
+    def quotes_as_of(self, as_of: pd.Timestamp, entities: list[str] | None = None) -> pd.DataFrame:
+        """NBBO bid/ask quotes (Alpaca) for spread modeling in the Execution
+        Replay phase. Same enforcement and same ~2016 coverage floor as
+        bars_as_of."""
+        df = load_quotes(entities)
+        return self._enforce_and_log("quotes", as_of, df)
+
+    def corporate_actions_as_of(self, as_of: pd.Timestamp, entities: list[str] | None = None) -> pd.DataFrame:
+        """Splits/dividends (Alpaca) needed to correctly track position size
+        and cash across corporate events during replay -- see
+        build_corporate_actions for why available_at is pinned to ex_date."""
+        df = load_corporate_actions(entities)
+        return self._enforce_and_log("corporate_actions", as_of, df)
+
     def snapshot_as_of(self, ticker: str, as_of: pd.Timestamp,
                         price_lookback: int | None = None,
                         news_lookback: pd.Timedelta | None = None) -> dict:
@@ -677,6 +1056,46 @@ class PointInTimeStore:
         return {"ticker": ticker, "cik": cik, "as_of": as_of,
                 "prices": prices, "news": news, "fundamentals": fundamentals,
                 "derived_features": derived_features}
+
+    def universe_snapshot_as_of(self, as_of: pd.Timestamp, cash: float, positions: dict[str, float],
+                                 tickers: list[str] | None = None,
+                                 price_lookback: int | None = 10,
+                                 news_lookback: pd.Timedelta | None = pd.Timedelta(days=3)) -> dict:
+        """Portfolio-level sibling of snapshot_as_of: one bundle covering the
+        whole tradeable universe at once, not one ticker. Needed because the
+        benchmark's own metrics (Sharpe, Sortino, max drawdown, the
+        Attribution regression) are computed on the *combined* portfolio's
+        return series, not per-ticker -- a design where the agent only ever
+        sees one ticker at a time structurally can't make a sensible
+        portfolio-level risk decision, e.g. it could load up on five
+        correlated names without any one of those five decisions ever
+        having visibility into the other four.
+
+        `cash` and `positions` (a {ticker: shares_held} dict) are required,
+        not defaulted -- this class has no way to know a running portfolio's
+        state on its own; it's dynamic state that changes with every fill,
+        owned by whatever runs the episode loop (the Replay Engine side),
+        and must be passed in explicitly rather than assumed.
+
+        `tickers` defaults to EVALUATION_TICKERS, not
+        EVALUATION_TICKERS + BENCHMARK_TICKERS -- benchmarks are passive
+        comparison points, never something the agent is asked to trade.
+
+        price_lookback/news_lookback default much tighter here (10 rows /
+        3 days) than snapshot_as_of's own default (unlimited) -- bundling
+        20 tickers' worth of full history into one prompt is a real token
+        cost multiplier that a single-ticker call doesn't have to worry
+        about."""
+        if tickers is None:
+            tickers = EVALUATION_TICKERS
+        return {
+            "as_of": as_of,
+            "cash": cash,
+            "positions": positions,
+            "tickers": {t: self.snapshot_as_of(t, as_of, price_lookback=price_lookback,
+                                                news_lookback=news_lookback)
+                        for t in tickers},
+        }
 
     def check(self, dataset: str, as_of: pd.Timestamp, requested_timestamps: pd.Series) -> tuple[bool, int]:
         """Explicit boundary check for a candidate access request (e.g. a tool
@@ -719,6 +1138,7 @@ def _fit_best_hmm(train: np.ndarray, n_states: int, n_restarts: int, n_iter: int
 
     from hmmlearn import hmm
 
+    logging.getLogger("hmmlearn").setLevel(logging.ERROR)
     best = None
     for k in range(n_restarts):
         try:
@@ -828,8 +1248,15 @@ def generate_episode_windows(
     state/memory can leak between consecutive evaluation episodes."""
     # UTC, to match every other timestamp in this pipeline (available_at
     # columns, regime label index) -- naive timestamps here would silently
-    # fail to compare against them downstream.
-    start, end = pd.Timestamp(start, tz="UTC"), pd.Timestamp(end, tz="UTC")
+    # fail to compare against them downstream. Accepts either a naive input
+    # (localized here) or an already-UTC-aware one (e.g. the EPISODE_RANGE_*
+    # constants above) without raising -- pd.Timestamp(aware_ts, tz="UTC")
+    # itself raises, so this can't just be the one-liner it used to be.
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
+    if start.tzinfo is None:
+        start = start.tz_localize("UTC")
+    if end.tzinfo is None:
+        end = end.tz_localize("UTC")
     windows = []
     cursor = start
     while cursor + window_len <= end:
@@ -847,7 +1274,21 @@ def assign_episode_regimes(
     execution -- not derived afterward from what the agent saw. Uses the
     majority regime observed within the window from the walk-forward
     `label_regimes` output (which itself never looks past its own date, so
-    this stays leakage-free too)."""
+    this stays leakage-free too).
+
+    Deliberate decision: this table's output is never passed into
+    snapshot_as_of, universe_snapshot_as_of, or anything else agent-facing.
+    "Assigned prior to execution" describes when the label gets computed
+    (before the episode runs, so the labeling process itself can't cheat by
+    looking at the outcome), not a promise that the agent is shown it. The
+    whole point of Phase 3's regime-robustness check is whether the agent's
+    real behavior degrades in a crisis it wasn't told about -- handing the
+    agent an explicit "you are in: CRISIS" tag would turn that into a test
+    of whether the agent can read a label, not whether its edge survives a
+    real crash. The agent isn't left blind either way: realized_vol (the
+    same raw volatility signal label_regimes itself trains on) is already
+    in every derived_features dict -- raw signal in, the HMM's conclusion
+    withheld. This table stays a Phase 3 bookkeeping input only."""
     rows = []
     for start, end in windows:
         seg = regimes.loc[(regimes.index >= start) & (regimes.index < end)]
@@ -930,6 +1371,22 @@ def main() -> None:
     sub.add_parser("build-news-entity-backfill")
     sub.add_parser("build-all")
 
+    p = sub.add_parser("build-intraday-bars", help="Alpaca minute/hour bars, ~2016+ only")
+    p.add_argument("--tickers", nargs="+", required=True)
+    p.add_argument("--start", required=True, help="e.g. 2020-01-01")
+    p.add_argument("--end", required=True)
+    p.add_argument("--timeframe", default="1Min", choices=sorted(_ALPACA_TIMEFRAME_MINUTES))
+
+    p = sub.add_parser("build-quotes", help="Alpaca NBBO bid/ask quotes, ~2016+ only")
+    p.add_argument("--tickers", nargs="+", required=True)
+    p.add_argument("--start", required=True)
+    p.add_argument("--end", required=True)
+
+    p = sub.add_parser("build-corporate-actions", help="Alpaca splits/dividends")
+    p.add_argument("--tickers", nargs="+", required=True)
+    p.add_argument("--start", required=True)
+    p.add_argument("--end", required=True)
+
     args = parser.parse_args()
 
     if args.command == "build-prices":
@@ -942,6 +1399,12 @@ def main() -> None:
         build_entity_map()
     elif args.command == "build-news-entity-backfill":
         build_news_entity_backfill()
+    elif args.command == "build-intraday-bars":
+        build_intraday_bars(args.tickers, args.start, args.end, timeframe=args.timeframe)
+    elif args.command == "build-quotes":
+        build_quotes(args.tickers, args.start, args.end)
+    elif args.command == "build-corporate-actions":
+        build_corporate_actions(args.tickers, args.start, args.end)
     elif args.command == "build-all":
         build_prices()
         build_fundamentals()

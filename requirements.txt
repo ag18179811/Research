@@ -1,0 +1,8 @@
+pandas
+numpy
+hmmlearn
+pyarrow
+flashtext
+requests
+python-dotenv
+tiktoken
