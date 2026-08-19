@@ -26,13 +26,13 @@ It is NOT the same as full intraday realism -- Phase 2's replay engine
 supports maker/taker/impact mechanics, but this runner only feeds it one
 snapshot per ticker per day, because the upstream data (FNSPID) is daily
 OHLCV, not an intraday order book. If you get access to intraday quotes,
-swap `_synthesize_snapshot` below for a real book snapshot and this loop
-does not need to change.
+swap `execution_harness.synthesize_snapshot` for a real book snapshot and
+this loop does not need to change.
 
 SYNTHETIC MICROSTRUCTURE NOTE:
-Phase 1's raw data has no bid/ask/depth (FNSPID is OHLCV only). This
-runner fabricates bid/ask from the close price and a flat assumed spread,
-and depth from a fraction of trailing average volume. That is a
+Phase 1's raw data has no bid/ask/depth (FNSPID is OHLCV only).
+`execution_harness` fabricates bid/ask from the close price and a flat
+assumed spread, and depth from a fraction of trailing average volume. That is a
 placeholder, not a validated microstructure model -- it exists so the
 Phase 2 engine has something to execute against. Treat any Executable
 Performance numbers produced this way as illustrative until real
@@ -68,9 +68,9 @@ from execution_replay import (  # noqa: E402
     Order,
     OrderSide,
     OrderType,
-    MarketDataSnapshot,
     MarketRegime,
 )
+from execution_harness import execute_orders_for_day  # noqa: E402
 
 REGIME_LABEL_TO_ENUM = {
     "trending": MarketRegime.TRENDING,
@@ -99,46 +99,6 @@ class AgentFn(Protocol):
         cash: float,
         as_of: pd.Timestamp,
     ) -> list[Order]: ...
-
-
-# ---------------------------------------------------------------------------
-# Synthetic microstructure (see module docstring)
-# ---------------------------------------------------------------------------
-
-
-def _synthesize_snapshot(
-    ticker: str,
-    execution_date: pd.Timestamp,
-    todays_price_row: pd.Series,
-    trailing_prices: pd.DataFrame,
-    regime: MarketRegime,
-    spread_bps: float = 5.0,
-    depth_fraction: float = 0.02,
-    vol_window: int = 21,
-) -> MarketDataSnapshot:
-    close = float(todays_price_row["adj_close"])
-    half_spread = close * (spread_bps / 10000.0) / 2
-    bid, ask = close - half_spread, close + half_spread
-
-    vol_col = trailing_prices["adj_close"].pct_change().tail(vol_window)
-    daily_vol = float(vol_col.std()) if vol_col.notna().sum() >= 2 else 0.02
-
-    adv = float(trailing_prices["volume"].tail(vol_window).mean()) if "volume" in trailing_prices else 1e6
-    if not np.isfinite(adv) or adv <= 0:
-        adv = 1e6
-    depth = adv * depth_fraction
-
-    return MarketDataSnapshot(
-        timestamp=execution_date.isoformat(),
-        symbol=ticker,
-        bid_price=bid,
-        ask_price=ask,
-        bid_depth=depth,
-        ask_depth=depth,
-        daily_volatility=daily_vol if np.isfinite(daily_vol) else 0.02,
-        average_daily_volume=adv,
-        regime=regime,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -189,27 +149,19 @@ def run_episode(
             log.exception("agent_fn raised on %s -- treating as no-trade for this day", day)
             orders = []
 
-        todays_close = {}
-        for t in tickers:
-            t_prices = all_prices[all_prices["entity"] == t].sort_values("date")
-            todays_row = t_prices[t_prices["date"] == day]
-            if todays_row.empty:
-                continue  # no print for this ticker today (halt/holiday mismatch)
-            todays_close[t] = float(todays_row.iloc[0]["adj_close"])
-
-            ticker_orders = [o for o in orders if o.symbol == t]
-            if not ticker_orders:
-                continue
-            trailing = t_prices[t_prices["date"] < day]
-            snapshot = _synthesize_snapshot(t, day, todays_row.iloc[0], trailing, regime_enum)
-            for order in ticker_orders:
-                order_counter += 1
-                if not order.order_id:
-                    order.order_id = f"{t}-{day.date()}-{order_counter}"
-                engine.process_order(order, snapshot)
+        todays_close, order_counter = execute_orders_for_day(
+            engine, orders, day, all_prices, tickers, regime_enum, order_counter,
+        )
 
         if todays_close:
-            portfolio_values[day] = engine.compute_portfolio_value(todays_close)
+            # record_daily_value both marks to market and appends to the
+            # engine's daily_portfolio_log, so export_logs_to_json() emits a
+            # populated "daily_portfolio_values" array instead of an empty
+            # one. Reuse its return value rather than calling
+            # compute_portfolio_value separately -- one mark per day, not two.
+            portfolio_values[day] = engine.record_daily_value(
+                day.date().isoformat(), todays_close
+            ).portfolio_value
 
     pv_series = pd.Series(portfolio_values).sort_index()
     return EpisodeRun(
