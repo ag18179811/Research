@@ -93,7 +93,7 @@ class Phase15Bridge:
         store: "dataprep.PointInTimeStore",
         gemini_api_key: str,
         tickers: list[str] | None = None,
-        model_name: str = "gemini-2.5-flash",
+        model_name: str = "gemini-3.6-flash",
         adv_window: int = 21,
         synthetic_spread_bps: float = 5.0,
     ):
@@ -449,7 +449,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start-date", required=True, help="e.g. 2022-06-09")
     parser.add_argument("--days", type=int, default=90)
-    parser.add_argument("--model", default="gemini-2.5-flash")
+    parser.add_argument("--model", default="gemini-3.6-flash")
     parser.add_argument("--tickers", nargs="*", default=None)
     args = parser.parse_args()
 

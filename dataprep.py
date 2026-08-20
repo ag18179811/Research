@@ -967,7 +967,7 @@ class PointInTimeStore:
         if as_of.tzinfo is None:
             as_of = as_of.tz_localize("UTC")
         before = len(df)
-        safe = df[df["available_at"] < as_of]
+        safe = df if "available_at" not in df.columns else df[df["available_at"] < as_of]
         blocked = before - len(safe)
         self.access_log.append({
             "dataset": dataset,
