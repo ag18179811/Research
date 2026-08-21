@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import argparse
@@ -28,9 +27,8 @@ from execution_replay import (
     ReplayConfig,
 )
 
-# --- Gemini -------------------------------------------------------------
-from google import genai
-from google.genai import types
+# --- Claude ---------------------------------------------------------------
+import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()  # reads a .env file in the current directory into os.environ
@@ -68,7 +66,6 @@ class TradeRecord:
     limit_price: Optional[float]
     reasoning: str
 
-
 DECISION_SCHEMA_HINT = """
 Respond with ONLY a JSON object (no markdown fences, no commentary) matching:
 {
@@ -91,18 +88,20 @@ class Phase15Bridge:
     def __init__(
         self,
         store: "dataprep.PointInTimeStore",
-        gemini_api_key: str,
+        claude_api_key: str,
         tickers: list[str] | None = None,
-        model_name: str = "gemini-3.6-flash",
+        model_name: str = "claude-haiku-4-5-20251001",
+        max_tokens: int = 1024,
         adv_window: int = 21,
         synthetic_spread_bps: float = 5.0,
     ):
         self.store = store
         self.tickers = tickers or dataprep.EVALUATION_TICKERS
         self.model_name = model_name
+        self.max_tokens = max_tokens
         self.adv_window = adv_window
         self.synthetic_spread_bps = synthetic_spread_bps
-        self.client = genai.Client(api_key=gemini_api_key)
+        self.client = anthropic.Anthropic(api_key=claude_api_key)
         self._regime_series: pd.Series | None = None  # lazily built, cached
 
     # -- market-wide regime, computed once from SPY, never shown to the LLM --
@@ -141,7 +140,13 @@ class Phase15Bridge:
     def _quote_snapshot(self, ticker: str, as_of: pd.Timestamp) -> dict:
         try:
             quotes = self.store.quotes_as_of(as_of, entities=[ticker])
-        except FileNotFoundError:
+        except (FileNotFoundError, KeyError):
+            # KeyError happens when quotes.py's build ran but never reached
+            # this specific ticker (interrupted mid-run) -- load_quotes then
+            # returns a fully empty DataFrame with no columns at all, and
+            # the store's own available_at filter KeyErrors on it. Treat
+            # both cases the same way: no real quotes for this ticker, fall
+            # through to the synthetic estimate below.
             quotes = pd.DataFrame()
 
         if not quotes.empty:
@@ -220,20 +225,27 @@ class Phase15Bridge:
         ]
         return "\n".join(lines)
 
-    # -- call Gemini -------------------------------------------------------
+    # -- call Claude -------------------------------------------------------
     def _call_llm(self, prompt: str) -> dict:
-        response = self.client.models.generate_content(
+        response = self.client.messages.create(
             model=self.model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
+            max_tokens=self.max_tokens,
+            system=(
+                "You are a JSON-only API. Respond with exactly one JSON "
+                "object matching the requested schema and nothing else -- "
+                "no markdown code fences, no commentary before or after."
+            ),
+            messages=[{"role": "user", "content": prompt}],
         )
-        text = response.text.strip()
+        text = "".join(block.text for block in response.content if block.type == "text").strip()
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             # Belt-and-suspenders: strip stray code fences and retry once
-            # before giving up, even though response_mime_type should
-            # already prevent this.
+            # before giving up. More important here than it was with Gemini,
+            # since Claude has no request-level JSON-mode enforcement -- the
+            # system prompt above is the only thing steering it, and it can
+            # still occasionally wrap output in ```json fences anyway.
             cleaned = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE).strip()
             return json.loads(cleaned)
 
@@ -449,16 +461,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start-date", required=True, help="e.g. 2022-06-09")
     parser.add_argument("--days", type=int, default=90)
-    parser.add_argument("--model", default="gemini-3.6-flash")
+    parser.add_argument("--model", default="claude-haiku-4-5-20251001")
     parser.add_argument("--tickers", nargs="*", default=None)
     args = parser.parse_args()
 
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("CLAUDE_API_KEY")
     if not api_key:
-        raise RuntimeError("set GEMINI_API_KEY in your environment before running this")
+        raise RuntimeError("set CLAUDE_API_KEY in your environment before running this")
 
     store = dataprep.PointInTimeStore()
-    bridge = Phase15Bridge(store, gemini_api_key=api_key, tickers=args.tickers, model_name=args.model)
+    bridge = Phase15Bridge(store, claude_api_key=api_key, tickers=args.tickers, model_name=args.model)
     engine, history = run_episode(bridge, args.start_date, n_days=args.days)
 
     n_trades = sum(1 for h in history if h.action != "HOLD")

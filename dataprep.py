@@ -1030,7 +1030,12 @@ class PointInTimeStore:
         if price_lookback and not prices.empty:
             prices = prices.sort_values("date").tail(price_lookback)
 
-        news = self.news_as_of(as_of, entities=[ticker])
+        # Narrow the parquet read to the year partition(s) the lookback
+        # window can actually touch -- news is partitioned by year on disk,
+        # so this is close to free, whereas an unfiltered read pulls the
+        # entire multi-decade, multi-GB news history for a single ticker.
+        news_years = sorted({(as_of - news_lookback).year, as_of.year}) if news_lookback else None
+        news = self.news_as_of(as_of, entities=[ticker], years=news_years)
         if news_lookback and not news.empty:
             news = news[news["published_at"] >= as_of - news_lookback]
 
