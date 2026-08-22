@@ -37,6 +37,7 @@ Raw sources (fetched live, need APCA_API_KEY_ID / APCA_API_SECRET_KEY in .env):
 from __future__ import annotations
 
 import argparse
+import io
 import logging
 import re
 import zipfile
@@ -582,6 +583,24 @@ def build_fundamentals(quarters: list[str] | None = None) -> None:
     log.info("fundamentals: done")
 
 
+def _trailing_quarters(as_of: pd.Timestamp, n_quarters: int) -> list[str]:
+    """Quarter labels (e.g. "2022q3", matching build_fundamentals' own
+    `zpath.stem` naming) for the `n_quarters` SEC quarterly archives ending
+    with the one `as_of` falls in. A filing's `available_at` (accepted/filed
+    date) almost always lands in the same quarterly archive as its own
+    filing date, so this is a safe, cheap way to bound load_fundamentals to
+    the handful of archives a recent-fundamentals lookup can actually use,
+    instead of opening all of them."""
+    year, q = as_of.year, (as_of.month - 1) // 3 + 1
+    labels = []
+    for _ in range(n_quarters):
+        labels.append(f"{year}q{q}")
+        q -= 1
+        if q == 0:
+            q, year = 4, year - 1
+    return labels
+
+
 def load_fundamentals(entities: list[int] | None = None, quarters: list[str] | None = None) -> pd.DataFrame:
     if not FUNDAMENTALS_DIR.exists():
         raise FileNotFoundError(f"no processed fundamentals at {FUNDAMENTALS_DIR}, run build-fundamentals first")
@@ -840,6 +859,77 @@ def load_corporate_actions(entities: list[str] | None = None) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Fama-French factor returns: Ken French Data Library
+# ---------------------------------------------------------------------------
+# The market/size/value factor series phase3.factor_attribution regresses
+# agent returns against, per the proposal's Attribution phase. Without this,
+# main.py's load_factor_returns() falls back to a degenerate SPY-only proxy
+# that cannot identify beta_size/beta_value at all -- see that function's
+# docstring for the full priority order (--factors FILE > this > proxy).
+
+FACTORS_DIR = PROCESSED_DIR / "factors"
+FAMA_FRENCH_DAILY_3_FACTOR_URL = (
+    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/"
+    "ftp/F-F_Research_Data_Factors_daily_CSV.zip"
+)
+
+
+def build_factors(url: str = FAMA_FRENCH_DAILY_3_FACTOR_URL) -> None:
+    """Downloads Ken French's daily 3-factor series (Mkt-RF/SMB/HML/RF) from
+    the Fama/French Data Library into data/processed/factors.
+
+    The published CSV isn't uniform, plain tabular data: it opens with a few
+    lines of free-text metadata (which CRSP vintage built the file, a note
+    about the risk-free rate source) and closes with a blank line and a
+    copyright notice, wrapped around the actual `date,Mkt-RF,SMB,HML,RF`
+    table. Rather than skip a fixed number of header/footer lines -- fragile
+    against Ken French revising the preamble, which has already happened
+    once (Flat File Format 2.0 in 2025) -- every line is matched against
+    `^\\d{8},` (an 8-digit YYYYMMDD date followed by a comma) and only those
+    are treated as data.
+
+    Uses curl rather than urllib/requests: see build_entity_map's own note
+    on this machine's broken local CA bundle."""
+    import subprocess
+
+    result = subprocess.run(["curl", "-sL", url], capture_output=True, check=True)
+    with zipfile.ZipFile(io.BytesIO(result.stdout)) as zf:
+        name = next(n for n in zf.namelist() if n.lower().endswith(".csv"))
+        raw = zf.read(name).decode("utf-8", errors="replace")
+
+    data_lines = [ln for ln in raw.splitlines() if re.match(r"^\d{8},", ln.strip())]
+    if not data_lines:
+        raise ValueError(f"no data rows found in {url} -- Ken French may have changed the file format")
+
+    df = pd.read_csv(io.StringIO("\n".join(data_lines)), header=None,
+                      names=["date", "mkt", "smb", "hml", "rf"])
+    df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", utc=True)
+    # Published in percent (0.53 == 0.53%); factor_attribution regresses
+    # against decimal portfolio returns, so convert once here rather than
+    # relying on every consumer to notice and rescale.
+    for c in ("mkt", "smb", "hml", "rf"):
+        df[c] = df[c].astype(float) / 100.0
+    df = df.sort_values("date").reset_index(drop=True)
+
+    FACTORS_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(FACTORS_DIR / "data.parquet", index=False)
+    log.info("factors: %d daily Fama-French 3-factor observations, %s -> %s written",
+              len(df), df["date"].min().date(), df["date"].max().date())
+
+
+def load_factors() -> pd.DataFrame:
+    """Date-indexed ["mkt","smb","hml"] frame, decimal-scaled, ready for
+    phase3.factor_attribution / phase3.block_bootstrap_ci(metric="alpha").
+    `rf` is kept as an extra column (not required by those callers) for
+    anyone who wants true excess-return regressions later."""
+    path = FACTORS_DIR / "data.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"no processed factors at {FACTORS_DIR}, run build-factors first")
+    df = pd.read_parquet(path)
+    return df.set_index("date").sort_index()
+
+
+# ---------------------------------------------------------------------------
 # Entity resolution: SEC CIK <-> ticker crosswalk
 # ---------------------------------------------------------------------------
 # Prices/news are keyed by ticker; SEC fundamentals are keyed by CIK (SEC
@@ -1020,7 +1110,8 @@ class PointInTimeStore:
 
     def snapshot_as_of(self, ticker: str, as_of: pd.Timestamp,
                         price_lookback: int | None = None,
-                        news_lookback: pd.Timedelta | None = None) -> dict:
+                        news_lookback: pd.Timedelta | None = None,
+                        fundamentals_lookback_quarters: int | None = None) -> dict:
         """Point-in-time-consistent bundle across all three sources for one
         ticker, all filtered to the same `as_of` cutoff -- this is the
         multi-source view an agent actually consumes. The raw datasets stay
@@ -1043,7 +1134,9 @@ class PointInTimeStore:
         if cik is None:
             fundamentals = pd.DataFrame()
         else:
-            fundamentals = self.fundamentals_as_of(as_of, entities=[cik])
+            quarters = (_trailing_quarters(as_of, fundamentals_lookback_quarters)
+                        if fundamentals_lookback_quarters else None)
+            fundamentals = self.fundamentals_as_of(as_of, entities=[cik], quarters=quarters)
             if not fundamentals.empty:
                 # A fact can be refiled/amended after its original filing.
                 # Keep only the most-recently-known value per (tag, ddate)
@@ -1374,6 +1467,7 @@ def main() -> None:
 
     sub.add_parser("build-entity-map")
     sub.add_parser("build-news-entity-backfill")
+    sub.add_parser("build-factors", help="Ken French daily 3-factor series (Mkt-RF/SMB/HML/RF)")
     sub.add_parser("build-all")
 
     p = sub.add_parser("build-intraday-bars", help="Alpaca minute/hour bars, ~2016+ only")
@@ -1404,6 +1498,8 @@ def main() -> None:
         build_entity_map()
     elif args.command == "build-news-entity-backfill":
         build_news_entity_backfill()
+    elif args.command == "build-factors":
+        build_factors()
     elif args.command == "build-intraday-bars":
         build_intraday_bars(args.tickers, args.start, args.end, timeframe=args.timeframe)
     elif args.command == "build-quotes":
@@ -1416,6 +1512,7 @@ def main() -> None:
         build_news()
         build_entity_map()
         build_news_entity_backfill()
+        build_factors()
 
 
 if __name__ == "__main__":

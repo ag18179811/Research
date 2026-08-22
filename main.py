@@ -9,8 +9,7 @@ order, or reads a raw dataset on its own.
     Phase 1.5  phase1_5_agent.py    LLM decision loop (opt-in, see `backtest`)
     Phase 2    execution_replay.py  fills, fees, market impact
                execution_harness.py orders -> engine, one day at a time
-    Phase 3    runner.py            drives an agent through episodes
-               metrics.py           joint metric report
+    Phase 3    phase3.py            episode runner, agents, joint metric report
                comparison.py        leaderboard + coordination breakeven spread
 
 Typical run, from nothing to a leaderboard:
@@ -42,9 +41,9 @@ log = logging.getLogger("main")
 PROJECT_DIR = Path(__file__).resolve().parent
 RUNS_DIR = PROJECT_DIR / "runs"
 
-# The three control-group agents from runner.py. `llm` is handled separately
-# (see _build_agent) because it is not currently runnable.
-BASELINE_AGENTS = ("no_trade", "buy_and_hold", "random")
+# The passive-benchmark control group from phase3.py. `llm` is handled
+# separately (see _build_agent) because it is not currently runnable.
+BASELINE_AGENTS = ("buy_and_hold",)
 AGENT_CHOICES = BASELINE_AGENTS + ("llm",)
 
 
@@ -54,16 +53,12 @@ AGENT_CHOICES = BASELINE_AGENTS + ("llm",)
 
 
 def _build_agent(name: str, tickers: list[str], seed: int = 0):
-    """Returns a runner.AgentFn for `name`. Baselines come straight from
-    runner.py; the Phase 1.5 LLM agent is not wired up (see below)."""
-    import runner  # local import: pulls in metrics/pandas, not needed for `data`
+    """Returns a phase3.AgentFn for `name`. Baselines come straight from
+    phase3.py; the Phase 1.5 LLM agent is not wired up (see below)."""
+    import phase3  # local import: pulls in numpy/pandas, not needed for `data`
 
-    if name == "no_trade":
-        return runner.no_trade_agent
     if name == "buy_and_hold":
-        return runner.buy_and_hold_agent_factory(tickers)
-    if name == "random":
-        return runner.random_agent_factory(tickers, seed=seed)
+        return phase3.buy_and_hold_agent_factory(tickers)
 
     if name == "llm":
         # Two independent blockers, reported together so you find out about
@@ -104,24 +99,26 @@ def _build_agent(name: str, tickers: list[str], seed: int = 0):
 
 def load_factor_returns(path: str | None) -> pd.DataFrame:
     """Returns the date-indexed ["mkt","smb","hml"] frame that
-    metrics.factor_attribution() regresses against.
+    phase3.factor_attribution() regresses against. Three-tier priority:
 
-    Nothing in this repo produces Fama-French factors, so there are exactly
-    two honest options and this function makes the choice explicit:
+      --factors FILE   an explicit override -- any 3-factor daily CSV
+                       (Ken French format or equivalent), highest priority
+                       so you can substitute a vetted/custom series.
 
-      --factors FILE   a real 3-factor daily series (Ken French data library
-                       or equivalent), which is what the attribution actually
-                       claims to measure.
+      (omitted, and    the real thing: Ken French's own daily 3-factor
+       data/processed/  series, downloaded and parsed by
+       factors/ exists) dataprep.build_factors() (`python main.py data
+                       build` runs this) -- see dataprep.load_factors.
 
-      (omitted)        a SPY-only proxy: mkt = SPY daily returns, smb = hml = 0.
-                       beta_market stays meaningful. beta_size and beta_value
-                       are regressed against a column of zeros and are
-                       therefore NOT identified -- they are an artifact, not a
-                       measurement. Alpha absorbs all size/value exposure.
-
-    The proxy exists so the pipeline runs end to end before someone sources
-    the real factors. It warns loudly precisely so it never gets quietly
-    reported as a genuine three-factor attribution."""
+      (omitted, and    a SPY-only proxy: mkt = SPY daily returns,
+       factors were     smb = hml = 0. beta_market stays meaningful; beta_size
+       never built)     and beta_value are regressed against a column of
+                       zeros and are therefore NOT identified -- an
+                       artifact, not a measurement. Alpha absorbs all
+                       size/value exposure. Warns loudly precisely so it
+                       never gets quietly reported as a genuine three-factor
+                       attribution -- this is the last-resort path, not the
+                       default."""
     if path:
         df = pd.read_csv(path)
         df.columns = [c.strip().lower() for c in df.columns]
@@ -152,7 +149,13 @@ def load_factor_returns(path: str | None) -> pd.DataFrame:
             out = out / 100.0
         return out
 
-    # --- proxy path -------------------------------------------------------
+    # --- real Ken French factors, built locally by `data build` -----------
+    try:
+        return dataprep.load_factors()
+    except FileNotFoundError:
+        pass
+
+    # --- proxy path (last resort) ------------------------------------------
     spy = dataprep.load_prices(entities=["SPY"])
     if spy.empty:
         raise SystemExit(
@@ -213,7 +216,7 @@ def _episode_to_dict(ep) -> dict:
 
 
 def _episode_from_dict(d):
-    from metrics import EpisodeRun
+    from phase3 import EpisodeRun
 
     pv = pd.Series(
         {pd.Timestamp(k): v for k, v in d["portfolio_values"].items()},
@@ -240,6 +243,16 @@ def cmd_data(args) -> int:
     dataprep.build_prices(limit_tickers=args.limit)
     dataprep.build_fundamentals()
     dataprep.build_entity_map()
+
+    try:
+        dataprep.build_factors()
+    except Exception:
+        # Unlike prices/fundamentals/entity-map, factors has a built-in
+        # fallback (load_factor_returns' SPY-only proxy) -- a flaky fetch
+        # from Dartmouth's server shouldn't abort the rest of the Phase 1
+        # build over a dataset only the `report` command's Attribution
+        # phase needs.
+        log.exception("failed to fetch Ken French factors; `report` will fall back to the SPY proxy")
 
     if args.with_news:
         # RAW_NEWS_CSV (~/nasdaq_exteral_data.csv) is not present in every
@@ -269,7 +282,7 @@ def cmd_demo(args) -> int:
 
 
 def cmd_backtest(args) -> int:
-    import runner
+    import phase3
     from execution_replay import ReplayConfig
 
     tickers = args.tickers or dataprep.EVALUATION_TICKERS
@@ -279,7 +292,7 @@ def cmd_backtest(args) -> int:
     print(f"backtest: agent={args.agent} tickers={len(tickers)} "
           f"{args.start} -> {args.end}")
 
-    runs = runner.run_all_episodes(
+    runs = phase3.run_all_episodes(
         agent_fn,
         tickers,
         start=args.start,
@@ -305,7 +318,7 @@ def cmd_backtest(args) -> int:
 
 
 def cmd_report(args) -> int:
-    import metrics
+    import phase3
     import comparison
 
     systems = args.systems or [p.stem for p in sorted(RUNS_DIR.glob("*.json"))]
@@ -332,7 +345,7 @@ def cmd_report(args) -> int:
         if not eps:
             log.warning("%s has no episodes; skipping", name)
             continue
-        reports[name] = metrics.build_joint_metric_report(
+        reports[name] = phase3.build_joint_metric_report(
             name, eps, factor_returns, n_boot=args.n_boot, seed=args.seed,
         )
         print()
@@ -342,7 +355,7 @@ def cmd_report(args) -> int:
     if baseline not in reports:
         # CBS is measured against a passive benchmark; fall back to whatever
         # is actually present rather than failing the whole report.
-        fallback = next((b for b in ("buy_and_hold", "no_trade") if b in reports), None)
+        fallback = "buy_and_hold" if "buy_and_hold" in reports else next(iter(reports), None)
         if fallback is None:
             log.warning("no baseline available; skipping leaderboard")
             return 0
@@ -388,7 +401,8 @@ def _add_report_args(p) -> None:
     p.add_argument("--systems", nargs="*", default=None,
                    help="default: every *.pkl in runs/")
     p.add_argument("--factors", default=None,
-                   help="CSV of daily mkt/smb/hml; omitted = SPY proxy (warns)")
+                   help="CSV of daily mkt/smb/hml; omitted = real Ken French factors "
+                        "if `data build` fetched them, else SPY proxy (warns)")
     p.add_argument("--baseline", default="buy_and_hold",
                    help="system that CBS is measured against")
     p.add_argument("--n-boot", type=int, default=1000)

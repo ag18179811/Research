@@ -25,7 +25,7 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
-from metrics import EpisodeRun, JointMetricReport, _fills_to_frame, net_monetary_return
+from phase3 import EpisodeRun, JointMetricReport, _fills_to_frame, net_monetary_return
 
 # ---------------------------------------------------------------------------
 # Coordination Breakeven Spread (CBS)

@@ -630,7 +630,7 @@ def coordination_ablation_table(results: dict[str, tuple]) -> pd.DataFrame:
     varies is the amount of coordination. Anything else and you are comparing
     strategies, not coordination.
     """
-    from metrics import sharpe_ratio
+    from phase3 import sharpe_ratio
     rows = []
     for name, (episodes, meter) in results.items():
         rets = pd.concat([ep.daily_returns() for ep in episodes]).sort_index()
