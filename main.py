@@ -46,50 +46,160 @@ RUNS_DIR = PROJECT_DIR / "runs"
 BASELINE_AGENTS = ("buy_and_hold",)
 AGENT_CHOICES = BASELINE_AGENTS + ("llm",)
 
+# Cheapest rung of the current ladder, and the one this pipeline was already
+# pointed at. Undated on purpose: this string doubles as the lookup key into
+# coordination_cost.MODEL_PRICES, which is keyed on undated IDs. Cost is a
+# model-selection question -- `report` prints the whole curve, not just this row.
+DEFAULT_MODEL = "claude-haiku-4-5"
+
 
 # ---------------------------------------------------------------------------
 # Agents
 # ---------------------------------------------------------------------------
 
 
-def _build_agent(name: str, tickers: list[str], seed: int = 0):
+def _build_agent(name: str, tickers: list[str], seed: int = 0,
+                 model: str = DEFAULT_MODEL, use_prompt_caching: bool = True):
     """Returns a phase3.AgentFn for `name`. Baselines come straight from
-    phase3.py; the Phase 1.5 LLM agent is not wired up (see below)."""
+    phase3.py; `llm` is the Anthropic-backed Phase 1.5 agent (see _LLMAgent).
+    `model` and `use_prompt_caching` are ignored by the baselines, which make
+    no API calls and therefore cost nothing to run."""
     import phase3  # local import: pulls in numpy/pandas, not needed for `data`
 
     if name == "buy_and_hold":
         return phase3.buy_and_hold_agent_factory(tickers)
 
     if name == "llm":
-        # Two independent blockers, reported together so you find out about
-        # both at once rather than fixing one and hitting the other.
-        problems = []
-        try:
-            from google import genai  # noqa: F401
-        except ImportError:
-            problems.append(
-                "  - google-genai is not installed (pip install google-genai), "
-                "so phase1_5_agent.py cannot even be imported."
-            )
-        problems.append(
-            "  - phase1_5_agent.Phase15Bridge does not implement runner.AgentFn. "
-            "It exposes run_day(...)/run_episode(...) and drives its own engine, "
-            "whereas run_all_episodes() expects "
-            "agent_fn(decision_snapshots, positions, cash, as_of) -> list[Order]. "
-            "An adapter has to be written before this path can run."
-        )
-        raise SystemExit(
-            "--agent llm is not runnable yet:\n"
-            + "\n".join(problems)
-            + "\n\nNote also that a code review flagged 3 HIGH issues in "
-            "phase1_5_agent.py, including a daily mark-to-market series that is "
-            "off by one trading day -- which feeds Sharpe/Sortino/max-drawdown. "
-            "Fix those before trusting any number this agent produces.\n"
-            "The baselines (%s) are unaffected and runnable now."
-            % ", ".join(BASELINE_AGENTS)
-        )
+        return _build_llm_agent(tickers, model=model,
+                                use_prompt_caching=use_prompt_caching)
 
     raise ValueError(f"unknown agent {name!r}")
+
+
+class _LLMAgent:
+    """Adapts phase1_5_agent.Phase15Bridge to phase3.AgentFn.
+
+    This is the adapter whose absence used to make `--agent llm` unrunnable. It
+    reuses the bridge's prompt construction, LLM call, decision validation, and
+    order conversion, and supplies the one thing phase3.run_episode needs and
+    the bridge did not: the (decision_snapshots, positions, cash, as_of) ->
+    list[Order] shape.
+
+    TWO DELIBERATE DIFFERENCES FROM Phase15Bridge.run_episode:
+
+    1. It does NOT drive the bridge's own ExecutionReplayEngine and does NOT call
+       _decision_to_market_snapshot. phase3.run_episode owns execution and
+       portfolio marking. That is what sidesteps the off-by-one daily
+       mark-to-market series flagged in the bridge's own episode loop -- the one
+       that feeds Sharpe/Sortino/max-drawdown. The bug is not fixed here; this
+       path simply never runs the code containing it. Anything calling
+       Phase15Bridge.run_episode directly is still affected.
+
+    2. The prompt is built from the `decision_snapshots` phase3.run_episode hands
+       over, not from a second read of the bridge's own store.
+       universe_snapshot_as_of returns {as_of, cash, positions, tickers}, and
+       `decision_snapshots` is exactly that `tickers` mapping, so the bundle is
+       reassembled rather than re-fetched. Re-reading would duplicate every
+       access in the temporal integrity log and scope it to the wrong store --
+       run_all_episodes builds a fresh PointInTimeStore per episode precisely
+       to keep that log per-episode.
+
+    Portfolio state is copied from the runner every day rather than tracked
+    independently: the engine is authoritative on cash and positions, and a
+    second running total would silently diverge from it.
+    """
+
+    def __init__(self, tickers: list[str], model: str,
+                 use_prompt_caching: bool = True):
+        import dataprep as _dataprep
+        import phase1_5_agent
+
+        self.tickers = tickers
+        self.model = model
+        # The store is only needed for the bridge's regime series (built from SPY
+        # and never shown to the LLM); snapshots come from phase3.run_episode.
+        self.bridge = phase1_5_agent.Phase15Bridge(
+            store=_dataprep.PointInTimeStore(),
+            tickers=tickers,
+            model_name=model,
+            use_prompt_caching=use_prompt_caching,
+        )
+        self._PortfolioState = phase1_5_agent.PortfolioState
+        self._TradeRecord = phase1_5_agent.TradeRecord
+        self.portfolio = self._PortfolioState()
+        self.history: list = []
+        self._order_seq = 0
+        self.n_agents = 1          # single seat; CoordinationMeter reads this
+
+    # -- CoordinationMeter hooks --------------------------------------------
+    def last_usage(self) -> dict | None:
+        return self.bridge.last_usage()
+
+    def prefix_tokens(self) -> int:
+        return self.bridge.measure_prefix_tokens()
+
+    def reset(self) -> None:
+        """Called by phase3.run_all_episodes between episodes. Trade history
+        must not leak across an episode boundary -- it goes into the prompt,
+        and carrying it over would show the agent decisions from a window it
+        is not supposed to have seen."""
+        self.portfolio = self._PortfolioState()
+        self.history = []
+        self._order_seq = 0
+
+    # -- phase3.AgentFn -------------------------------------------------------
+    def __call__(self, decision_snapshots, positions, cash, as_of):
+        self.portfolio.cash = float(cash)
+        self.portfolio.positions = dict(positions)
+
+        snap = {
+            "as_of": as_of,
+            "cash": float(cash),
+            "positions": dict(positions),
+            "tickers": decision_snapshots,
+        }
+
+        prompt = self.bridge._format_prompt(snap, self.portfolio, self.history, as_of)
+        raw = self.bridge._call_llm(prompt)
+        decision = self.bridge._validate_decision(raw, self.portfolio, snap)
+
+        self.history.append(self._TradeRecord(
+            date=as_of.date().isoformat(),
+            action=decision["action"],
+            symbol=decision.get("symbol"),
+            quantity=decision.get("quantity"),
+            order_type=decision.get("order_type"),
+            limit_price=decision.get("limit_price"),
+            reasoning=decision.get("reasoning", ""),
+        ))
+
+        order = self.bridge._decision_to_order(decision, as_of, self._order_seq)
+        if order is None:
+            return []
+        self._order_seq += 1
+        return [order]
+
+
+def _build_llm_agent(tickers: list[str], model: str,
+                     use_prompt_caching: bool = True) -> _LLMAgent:
+    """Constructs the Anthropic-backed agent, failing early and specifically."""
+    try:
+        import anthropic  # noqa: F401
+    except ImportError:
+        raise SystemExit(
+            "--agent llm needs the Anthropic SDK: pip install anthropic\n"
+            "(it is in requirements.txt)"
+        )
+
+    from coordination_cost import MODEL_PRICES
+    if model not in MODEL_PRICES:
+        raise SystemExit(
+            f"{model!r} has no entry in coordination_cost.MODEL_PRICES, so the run "
+            f"could not be priced. Add it with its source and verification date "
+            f"rather than guessing.\nKnown: {', '.join(sorted(MODEL_PRICES))}"
+        )
+
+    return _LLMAgent(tickers, model=model, use_prompt_caching=use_prompt_caching)
 
 
 # ---------------------------------------------------------------------------
@@ -281,16 +391,112 @@ def cmd_demo(args) -> int:
     return 0
 
 
+# NYSE trades ~252 days a year against a 365-day calendar. Used only to turn an
+# episode's calendar length into a decision count for the estimate.
+_TRADING_DAY_FRACTION = 252.0 / 365.0
+
+
+def _preflight(agent, args, cfg) -> int:
+    """Project the bill and refuse to start if it exceeds --max-spend.
+
+    A full sweep is ~3,000 calls, so an accidental `backtest --agent llm` on the
+    default date range is a real amount of money. Returns 0 to continue, non-zero
+    to stop. Costs one count_tokens call, which is not billed as inference.
+    """
+    from coordination_cost import estimate_cost
+
+    # Exact episode count from the same generator run_all_episodes uses, rather
+    # than a second derivation that could drift from it.
+    windows = dataprep.generate_episode_windows(
+        args.start, args.end,
+        pd.Timedelta(days=args.window_days),
+        pd.Timedelta(days=args.purge_days),
+    )
+    n_episodes = len(windows)
+    if not n_episodes:
+        raise SystemExit(f"no episode windows between {args.start} and {args.end}")
+    # One decision per trading day per episode; the trading-day count inside a
+    # calendar window is approximated, which is why this is a guard not a quote.
+    per_episode = max(int(args.window_days * _TRADING_DAY_FRACTION), 1)
+    n_decisions = n_episodes * per_episode
+
+    prefix = agent.prefix_tokens()
+    # Input per call is dominated by the per-ticker feature block. Measured
+    # length would be better, but it needs a built store and a real snapshot;
+    # the configured assumption is the honest stand-in and is labelled as such.
+    per_call_in = cfg.assumed_tokens_per_llm_call_in
+    est = estimate_cost(cfg, n_decisions, per_call_in, prefix_tokens=prefix)
+
+    print("\npreflight cost estimate")
+    print(f"  ({n_episodes} episode(s) x ~{per_episode} trading days "
+          f"= ~{n_decisions:,} decisions)")
+    print(est.summary(cfg))
+    print("  input tokens per call are ASSUMED, not measured -- treat this as a "
+          "budget guard, not a forecast.")
+
+    if args.estimate_only:
+        print("\n--estimate-only: stopping before any API call.")
+        return 1
+
+    if args.max_spend is None:
+        raise SystemExit(
+            "\nrefusing to start an unbounded paid run.\n"
+            "Pass --max-spend USD to authorise it (the projected list price "
+            f"above is ${est.list_usd:,.2f}), or --estimate-only to just price it."
+        )
+    if est.list_usd > args.max_spend:
+        raise SystemExit(
+            f"\nprojected list cost ${est.list_usd:,.2f} exceeds --max-spend "
+            f"${args.max_spend:,.2f}. Raise the cap, pick a cheaper model, or "
+            f"shorten the date range."
+        )
+    print(f"  authorised: ${est.list_usd:,.2f} <= --max-spend ${args.max_spend:,.2f}")
+    return 0
+
+
 def cmd_backtest(args) -> int:
     import phase3
     from execution_replay import ReplayConfig
+    from coordination_cost import CoordinationCostConfig, CoordinationMeter
 
     tickers = args.tickers or dataprep.EVALUATION_TICKERS
-    agent_fn = _build_agent(args.agent, tickers, seed=args.seed)
+    model = getattr(args, "model", DEFAULT_MODEL)
+    use_cache = not getattr(args, "no_cache", False)
+
+    # Argument validation before anything expensive is constructed, so this fires
+    # without the SDK installed and without touching the network.
+    if getattr(args, "batch", False):
+        raise SystemExit(
+            "--batch cannot be used with this agent.\n"
+            "The Batch API's 50% discount is real, but each day's prompt embeds "
+            "the trade history through the previous day, so decisions within an "
+            "episode are strictly sequential and cannot be submitted as one "
+            "batch. Applying the discount anyway would under-report the bill by "
+            "half.\n"
+            "A stateless decision variant (no history in the prompt) would be "
+            "batchable; that is a separate change."
+        )
+
+    agent_fn = _build_agent(args.agent, tickers, seed=args.seed,
+                            model=model, use_prompt_caching=use_cache)
     config = ReplayConfig(impact_gamma=args.impact_gamma)
 
+    # Only the LLM path costs anything, so only it gets metered. Wrapping a
+    # baseline would produce a meter full of $0.00 records and invite someone to
+    # read that as a measured result.
+    meter = None
+    if args.agent == "llm":
+        cost_cfg = CoordinationCostConfig(model=model, use_prompt_caching=use_cache)
+        rc = _preflight(agent_fn, args, cost_cfg)
+        if rc:
+            return 0
+        meter = CoordinationMeter(agent_fn, cost_cfg, name=args.agent)
+        meter._prefix_tokens = agent_fn.prefix_tokens()
+        agent_fn = meter
+
     print(f"backtest: agent={args.agent} tickers={len(tickers)} "
-          f"{args.start} -> {args.end}")
+          f"{args.start} -> {args.end}"
+          + (f" model={model}" if args.agent == "llm" else ""))
 
     runs = phase3.run_all_episodes(
         agent_fn,
@@ -309,11 +515,19 @@ def cmd_backtest(args) -> int:
         "impact_gamma": args.impact_gamma,
         "episodes": [_episode_to_dict(r) for r in runs],
     }
+    # Sibling key, not a change to the existing schema: run files written before
+    # metering existed still load, and cmd_report treats a missing "coordination"
+    # block as "this system paid nothing", which is correct for the baselines.
+    if meter is not None:
+        payload["coordination"] = meter.to_dict()
     with open(out, "w") as f:
         json.dump(payload, f, indent=2)
 
     fills = sum(len(r.execution_log) for r in runs)
     print(f"  {len(runs)} episode(s), {fills} fill(s) -> {out}")
+    if meter is not None:
+        print()
+        print(meter.report())
     return 0
 
 
@@ -329,6 +543,7 @@ def cmd_report(args) -> int:
 
     episodes_by_system: dict[str, list] = {}
     impact_enabled: dict[str, bool] = {}
+    meters: dict = {}          # system -> CoordinationMeter, for systems that paid
     for name in systems:
         path = RUNS_DIR / f"{name}.json"
         if not path.exists():
@@ -337,6 +552,12 @@ def cmd_report(args) -> int:
             payload = json.load(f)
         episodes_by_system[name] = [_episode_from_dict(d) for d in payload["episodes"]]
         impact_enabled[name] = payload.get("impact_gamma", 0.1) > 0
+        # Absent for the deterministic baselines and for any run file written
+        # before metering existed. Absent means "paid nothing", which is exactly
+        # right for an agent that makes no API calls.
+        if "coordination" in payload:
+            from coordination_cost import CoordinationMeter
+            meters[name] = CoordinationMeter.from_dict(payload["coordination"])
 
     factor_returns = load_factor_returns(args.factors)
 
@@ -368,7 +589,60 @@ def cmd_report(args) -> int:
     )
     print()
     print(comparison.leaderboard_summary(leaderboard))
+
+    _report_coordination_cost(meters, episodes_by_system, baseline)
     return 0
+
+
+def _report_coordination_cost(meters: dict, episodes_by_system: dict,
+                              baseline: str) -> None:
+    """The CBS the proposal actually promises: the coordinated system charged for
+    its own coordination, not just for trading frictions.
+
+    The leaderboard above measures CBS on trading costs alone. A system that only
+    wins because its LLM bill was never counted has not won."""
+    if not meters:
+        return
+    from coordination_cost import coordination_adjusted_cbs
+
+    print()
+    print("=" * 72)
+    print("COORDINATION COST")
+    print("=" * 72)
+
+    for name, meter in meters.items():
+        print()
+        print(meter.report())
+
+        curve = meter.cost_across_models()
+        if not curve.empty:
+            print()
+            print("  same token volume, priced across the ladder "
+                  "(cost is a model-selection decision, not a constant):")
+            print("    " + curve.to_string(index=False).replace("\n", "\n    "))
+            print("    NB: repricing swaps the RATE, not the tokenization. Models "
+                  "in a different tokenizer family would emit different counts "
+                  "for the same text; re-measure rather than trusting the swap.")
+
+        if name == baseline or baseline not in episodes_by_system:
+            continue
+        cbs = coordination_adjusted_cbs(
+            name, baseline,
+            episodes_by_system[name], episodes_by_system[baseline],
+            system_meter=meter,
+            # The baseline is deterministic unless it too has a meter on file,
+            # in which case it pays its own bill rather than being treated as free.
+            baseline_meter=meters.get(baseline),
+        )
+        print()
+        print(f"  CBS vs {baseline}:")
+        print(f"    trading costs only     : "
+              f"{'>grid' if cbs.cbs_bps_trading_only is None else f'{cbs.cbs_bps_trading_only:.0f} bps'}")
+        print(f"    with coordination bill : "
+              f"{'>grid' if cbs.cbs_bps_with_coordination is None else f'{cbs.cbs_bps_with_coordination:.0f} bps'}")
+        print(f"    edge retained at {cbs.mean_latency_seconds:.1f}s latency: "
+              f"{cbs.edge_retained:.1%}")
+        print(f"    verdict: {cbs.verdict()}")
 
 
 def cmd_all(args) -> int:
@@ -395,6 +669,25 @@ def _add_backtest_args(p) -> None:
     p.add_argument("--impact-gamma", type=float, default=0.1,
                    help="Almgren-Chriss impact scale; 0 disables market impact")
     p.add_argument("--seed", type=int, default=0)
+
+    # --- cost controls (only bite on --agent llm) --------------------------
+    from coordination_cost import MODEL_PRICES
+    p.add_argument("--model", default=DEFAULT_MODEL, choices=sorted(MODEL_PRICES),
+                   help=f"model to run and price against (default: {DEFAULT_MODEL}). "
+                        "Constrained to MODEL_PRICES keys so an unpriceable run "
+                        "fails at parse time rather than mid-sweep.")
+    p.add_argument("--no-cache", action="store_true",
+                   help="disable prompt caching. Caching only pays when the stable "
+                        "prefix clears the model's minimum; the preflight says "
+                        "whether it does.")
+    p.add_argument("--batch", action="store_true",
+                   help="request the Batch API's 50%% discount. Currently refused "
+                        "for the sequential LLM agent -- see the error for why.")
+    p.add_argument("--estimate-only", action="store_true",
+                   help="print the projected cost and exit without calling the API")
+    p.add_argument("--max-spend", type=float, default=None,
+                   help="USD ceiling on the projected list cost. Required for a "
+                        "paid run; the run refuses to start without it.")
 
 
 def _add_report_args(p) -> None:

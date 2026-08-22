@@ -15,17 +15,33 @@ D. `coordination_ablation`: same signals, same episodes, same seeds, N analysts
 
 USAGE
 -----
-    from agent_payload import resolve_counter
     from coordination_cost import CoordinationMeter, CoordinationCostConfig
-    from metered_committee import MeteredCommittee
 
-    counter = resolve_counter("claude-opus-5")       # count_tokens if creds exist
-    agent   = MeteredCommittee(tickers, counter, n_analysts=8)
-    metered = CoordinationMeter(agent, CoordinationCostConfig(model="claude-opus-5"))
-    runs    = run_all_episodes(metered, ...)
+    agent   = main._build_llm_agent(tickers, model="claude-haiku-4-5")
+    metered = CoordinationMeter(agent, CoordinationCostConfig(model="claude-haiku-4-5"))
+    runs    = runner.run_all_episodes(metered, tickers, start, end)
     print(metered.report())
 
-`run_cbs.py` runs the whole thing end to end.
+`main.py backtest --agent llm` runs the whole thing end to end, and
+`main.py report` reloads the meter from the run file and prints the
+coordination-adjusted CBS.
+
+HOW REAL TOKEN COUNTS GET IN
+----------------------------
+`usage_from_anthropic(response)` (below) converts an Anthropic SDK response into
+the key names DecisionRecord uses. The two cache channels are named differently
+on each side, and mapping them backwards silently swaps a 0.10x rate for a 1.25x
+one, so the conversion lives in exactly one place:
+
+    SDK response.usage              ->  DecisionRecord
+    -------------------------------     ---------------------
+    input_tokens                    ->  input_tokens        (uncached, 1.0x)
+    cache_read_input_tokens         ->  cached_input_tokens (0.10x)
+    cache_creation_input_tokens     ->  cache_write_tokens  (1.25x, or 2.0x at 1h)
+    output_tokens                   ->  output_tokens
+
+phase1_5_agent.Phase15Bridge calls it in _call_llm and exposes the result via
+last_usage(), which is the only hook CoordinationMeter looks for.
 
 THE METER IS ONLY AS GOOD AS THE AGENT UNDER IT
 -----------------------------------------------
@@ -34,11 +50,16 @@ CoordinationMeter cannot invent token counts. An agent that exposes neither
 returns today -- meters latency only and reports a token bill of $0.00.
 report() labels that case "ASSUMED -- do not publish", but coordination_adjusted_cbs
 will still hand back a CBS computed against a free committee. Wire real counts
-in (agent_payload.py measures them off the actual PiT payload) before believing
-any number this module prints.
+in before believing any number this module prints.
+
+Note that "the agent said something" and "the agent reported tokens" are tracked
+separately (DecisionRecord.measured vs .measured_tokens). An agent that returns
+only {"llm_calls": 3} has reported nothing about tokens, and report() must not
+call that MEASURED just because a usage dict came back non-empty.
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 import time
 from dataclasses import dataclass, field, replace
@@ -127,13 +148,28 @@ _A = "anthropic docs (first-party API)"
 
 MODEL_PRICES: dict[str, ModelPrice] = {
     "claude-haiku-4-5":  ModelPrice("Claude Haiku 4.5",  1.0,  5.0, _A, "2026-08-14", cache_min_tokens=4096),
+    "claude-sonnet-4-6": ModelPrice("Claude Sonnet 4.6", 3.0, 15.0, _A, "2026-08-21", cache_min_tokens=1024),
     "claude-sonnet-5":   ModelPrice("Claude Sonnet 5",   3.0, 15.0, _A, "2026-08-14", cache_min_tokens=1024),
     "claude-sonnet-5-intro": ModelPrice("Claude Sonnet 5 (intro, to 2026-08-31)",
                                                          2.0, 10.0, _A, "2026-08-14", cache_min_tokens=1024),
+    "claude-opus-4-6":   ModelPrice("Claude Opus 4.6",   5.0, 25.0, _A, "2026-08-21", cache_min_tokens=1024),
+    "claude-opus-4-7":   ModelPrice("Claude Opus 4.7",   5.0, 25.0, _A, "2026-08-21", cache_min_tokens=1024),
     "claude-opus-4-8":   ModelPrice("Claude Opus 4.8",   5.0, 25.0, _A, "2026-08-14", cache_min_tokens=1024),
     "claude-opus-5":     ModelPrice("Claude Opus 5",     5.0, 25.0, _A, "2026-08-14", cache_min_tokens=512),
     "claude-fable-5":    ModelPrice("Claude Fable 5",   10.0, 50.0, _A, "2026-08-14", cache_min_tokens=512),
 }
+
+# Two caveats on the table above, both of which move a reported number:
+#
+#   * "claude-sonnet-5" bills at the INTRO rate ($2/$10) through 2026-08-31, not
+#     the $3/$15 in its row. Until then a run priced on that key overstates its
+#     own bill by 50%; use "claude-sonnet-5-intro" to reproduce a real invoice
+#     dated before the cutover. After 2026-08-31 the intro key becomes a
+#     historical artifact and should not be used for new runs.
+#   * cache_min_tokens for the 4.6/4.7 rows is the general ~1024 documented
+#     minimum, not a per-model figure confirmed the way Haiku 4.5's 4096 and
+#     Opus 5's 512 were. Treat their `prefix_caches` verdict as provisional and
+#     confirm against cache_read_input_tokens on a real call before publishing.
 
 
 @dataclass
@@ -216,6 +252,143 @@ class CoordinationCostConfig:
 
 
 # ===========================================================================
+# A0. Getting real counts out of the SDK
+# ===========================================================================
+
+def usage_from_anthropic(response, llm_calls: int = 1) -> dict:
+    """Convert an Anthropic SDK response into the keys DecisionRecord uses.
+
+    `response` is a Message (or anything exposing `.usage`); a bare usage object
+    works too. Returns {} when there is no usage to read, which the meter treats
+    as "unmeasured" rather than as zero -- the distinction report() depends on.
+
+    The two cache channels are the whole reason this function exists. The SDK and
+    this module use different words for them, and the rates differ by 12.5x:
+
+        cache_read_input_tokens     -> cached_input_tokens  (0.10x base)
+        cache_creation_input_tokens -> cache_write_tokens   (1.25x base, 2.0x @1h)
+
+    Swap those two and a cache-heavy run reports roughly an order of magnitude off
+    in whichever direction flatters you least. Mapped once, here.
+
+    Note that `input_tokens` from the API is already UNCACHED-only -- the cached
+    and written tokens are reported separately and are NOT included in it. That
+    matches ModelPrice.cost()'s requirement that the three input channels be
+    disjoint, so no subtraction is needed. Adding them together before passing
+    them in is the classic ~3x overstatement.
+    """
+    usage = getattr(response, "usage", response)
+    if usage is None:
+        return {}
+
+    def _get(name: str) -> int:
+        # getattr for SDK objects, .get for a plain dict; None -> 0 because the
+        # cache fields are absent entirely on responses that did not use caching.
+        if isinstance(usage, dict):
+            value = usage.get(name)
+        else:
+            value = getattr(usage, name, None)
+        return int(value or 0)
+
+    input_tokens = _get("input_tokens")
+    output_tokens = _get("output_tokens")
+    cached = _get("cache_read_input_tokens")
+    written = _get("cache_creation_input_tokens")
+
+    if not (input_tokens or output_tokens or cached or written):
+        return {}
+
+    return {
+        "llm_calls": llm_calls,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached,
+        "cache_write_tokens": written,
+        "output_tokens": output_tokens,
+    }
+
+
+@dataclass(frozen=True)
+class CostEstimate:
+    """What a run is projected to cost, before it is allowed to start."""
+    n_decisions: int
+    input_tokens_per_call: int
+    output_tokens_per_call: int
+    prefix_tokens: int
+    prefix_caches: bool
+    list_usd: float           # undiscounted -- the number to publish
+    billed_usd: float         # after batch, if configured
+
+    def summary(self, cfg: "CoordinationCostConfig") -> str:
+        p = cfg.effective_price()
+        lines = [
+            f"  model            : {p.name} (${p.input_per_mtok:g}/${p.output_per_mtok:g} per MTok)",
+            f"  decisions        : {self.n_decisions:,}",
+            f"  tokens per call  : {self.input_tokens_per_call:,} in / "
+            f"{self.output_tokens_per_call:,} out (measured prefix "
+            f"{self.prefix_tokens:,})",
+            f"  prompt caching   : " + (
+                f"effective (prefix {self.prefix_tokens:,} >= "
+                f"minimum {p.cache_min_tokens:,})" if self.prefix_caches
+                else f"NO EFFECT -- prefix {self.prefix_tokens:,} is below this "
+                     f"model's {p.cache_min_tokens:,}-token minimum, so it will "
+                     f"silently not cache and no discount will apply"),
+            f"  projected (list) : ${self.list_usd:,.2f}",
+        ]
+        if abs(self.billed_usd - self.list_usd) > 1e-9:
+            lines.append(f"  projected (billed): ${self.billed_usd:,.2f}")
+        return "\n".join(lines)
+
+
+def estimate_cost(cfg: "CoordinationCostConfig", n_decisions: int,
+                  input_tokens_per_call: int, prefix_tokens: int = 0,
+                  output_tokens_per_call: int | None = None) -> CostEstimate:
+    """Project the bill for a run that has not happened yet.
+
+    `input_tokens_per_call` should come from a real count_tokens measurement of
+    one representative prompt (Phase15Bridge.measure_prefix_tokens measures the
+    stable half; the caller counts a full day's payload). Output is projected from
+    the configured assumption, because nothing can measure output before it exists
+    -- that is the loosest term in the estimate and the reason to treat the result
+    as a budget guard, not a forecast.
+
+    Caching is credited ONLY when the measured prefix clears the model's minimum.
+    Below it the API returns no error and no discount, so crediting one here would
+    reproduce exactly the flattering assumption this module exists to prevent.
+    """
+    p = cfg.effective_price()
+    out_per_call = (cfg.assumed_tokens_per_llm_call_out
+                    if output_tokens_per_call is None else output_tokens_per_call)
+    caches = bool(cfg.use_prompt_caching and prefix_tokens >= p.cache_min_tokens)
+
+    if caches:
+        # First call writes the prefix; the rest read it. Everything beyond the
+        # prefix is uncached on every call.
+        variable = max(input_tokens_per_call - prefix_tokens, 0)
+        uncached = variable * n_decisions
+        written = prefix_tokens
+        cached = prefix_tokens * max(n_decisions - 1, 0)
+    else:
+        uncached = input_tokens_per_call * n_decisions
+        written = cached = 0
+
+    out_total = out_per_call * n_decisions
+    list_usd = replace(p, cache_write_mult=p.cache_write_mult).cost(
+        uncached, out_total, cached, written, batch=False)
+    billed_usd = p.cost(uncached, out_total, cached, written,
+                        batch=cfg.use_batch_api)
+
+    return CostEstimate(
+        n_decisions=n_decisions,
+        input_tokens_per_call=input_tokens_per_call,
+        output_tokens_per_call=out_per_call,
+        prefix_tokens=prefix_tokens,
+        prefix_caches=caches,
+        list_usd=list_usd,
+        billed_usd=billed_usd,
+    )
+
+
+# ===========================================================================
 # A. The meter
 # ===========================================================================
 
@@ -230,7 +403,15 @@ class DecisionRecord:
     messages: int = 0
     latency_seconds: float = 0.0
     n_orders: int = 0
-    measured: bool = False           # True if the agent reported real counts
+    # Two separate questions, deliberately not collapsed into one flag:
+    #   measured        -- the agent returned a non-empty usage dict at all
+    #   measured_tokens -- that dict actually carried token counts
+    # An agent reporting only {"llm_calls": 3} satisfies the first and not the
+    # second, and every token figure on this record then came from the assumed
+    # per-call constants. Collapsing these is how a run gets labelled MEASURED
+    # while its entire bill is fabricated.
+    measured: bool = False
+    measured_tokens: bool = False
     failed: bool = False             # agent raised; latency still charged
 
     def token_cost_usd(self, cfg: CoordinationCostConfig) -> float:
@@ -311,7 +492,8 @@ class CoordinationMeter:
         if not calls and self.n_agents > 1:
             calls = self.n_agents              # assume one call per agent per decision
 
-        if measured and ("input_tokens" in usage or "cached_input_tokens" in usage):
+        measured_tokens = "input_tokens" in usage or "cached_input_tokens" in usage
+        if measured_tokens:
             # Real counts, already in the deployed model's tokenizer.
             uncached = int(usage.get("input_tokens", 0))
             cached = int(usage.get("cached_input_tokens", 0))
@@ -342,12 +524,55 @@ class CoordinationMeter:
             else (max(elapsed, calls * cfg.assumed_seconds_per_llm_call) if calls else elapsed),
             n_orders=n_orders,
             measured=measured,
+            measured_tokens=measured_tokens,
             failed=failed,
         ))
 
+    # --- persistence --------------------------------------------------------
+    # `backtest` and `report` are deliberately separate commands, so the meter has
+    # to survive a process boundary. JSON for the same reasons main.py gives for
+    # episodes: inspectable, shareable, and no arbitrary-code-execution risk on
+    # load. Timestamps go out ISO-8601 to match _episode_to_dict's convention.
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "n_agents": self.n_agents,
+            "prefix_tokens": self._prefix_tokens,
+            "config": dataclasses.asdict(self.cfg),
+            "records": [
+                {**r.__dict__, "as_of": pd.Timestamp(r.as_of).isoformat()}
+                for r in self.records
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CoordinationMeter":
+        """Rebuild a meter for reporting. The wrapped agent is gone -- this
+        instance is not callable, it just carries the records and the config
+        forward so report()/cost_across_models()/coordination_adjusted_cbs() can
+        run against them in a later process."""
+        cfg = CoordinationCostConfig(**d["config"])
+        meter = cls(agent=None, cfg=cfg, name=d.get("name", ""),
+                    n_agents=d.get("n_agents", 1))
+        meter._prefix_tokens = int(d.get("prefix_tokens", 0))
+        known = {f.name for f in dataclasses.fields(DecisionRecord)}
+        meter.records = [
+            DecisionRecord(**{
+                **{k: v for k, v in rec.items() if k in known},
+                "as_of": pd.Timestamp(rec["as_of"]),
+            })
+            for rec in d.get("records", [])
+        ]
+        return meter
+
     # --- reporting ----------------------------------------------------------
-    def total_token_cost_usd(self) -> float:
-        return sum(r.token_cost_usd(self.cfg) for r in self.records)
+    def total_token_cost_usd(self, list_price: bool = False) -> float:
+        """Total token bill. `list_price=True` ignores the batch discount and
+        prices everything at the undiscounted first-party rate -- the conservative
+        upper bound, and the number that stays true if a discount does not apply."""
+        cfg = replace(self.cfg, use_batch_api=False) if list_price else self.cfg
+        return sum(r.token_cost_usd(cfg) for r in self.records)
 
     def mean_latency_seconds(self) -> float:
         return float(np.mean([r.latency_seconds for r in self.records])) if self.records else 0.0
@@ -362,9 +587,18 @@ class CoordinationMeter:
             return f"{self.name}: no decisions metered."
         f = self.frame()
         p = self.cfg.effective_price()
-        provenance = (getattr(self, "token_provenance", None)
-                      or ("MEASURED from the agent" if f["measured"].any()
-                          else "ASSUMED -- not measured, do not publish"))
+        # Keyed off measured_tokens, not measured. An agent that returned a usage
+        # dict carrying no token counts has told us nothing about its bill, and
+        # labelling that MEASURED is how an entirely assumed figure gets published.
+        n_measured = int(f["measured_tokens"].sum())
+        if n_measured == len(f):
+            provenance = "MEASURED from the agent"
+        elif n_measured:
+            provenance = (f"PARTIAL -- {n_measured:,}/{len(f):,} decisions measured, "
+                          f"the rest assumed; do not publish")
+        else:
+            provenance = "ASSUMED -- not measured, do not publish"
+        provenance = getattr(self, "token_provenance", None) or provenance
         n_fail = int(f["failed"].sum())
         return "\n".join([
             f"=== Coordination cost: {self.name} ===",
@@ -385,7 +619,18 @@ class CoordinationMeter:
             f"{int(f['cache_write_tokens'].sum()):,} cache-write",
             f"  output tokens        : {int(f['output_tokens'].sum()):,}",
             f"  inter-agent messages : {int(f['messages'].sum()):,}",
-            f"  token cost           : ${self.total_token_cost_usd():,.2f}",
+            # List price is the headline: it is the conservative upper bound and
+            # the only figure that does not depend on a discount holding. The
+            # discounted line is what was actually billed, shown beneath it so the
+            # two can never be confused for one another in a writeup.
+            f"  token cost (list)    : ${self.total_token_cost_usd(list_price=True):,.2f}",
+            f"  token cost (billed)  : ${self.total_token_cost_usd():,.2f}"
+            + ("  [batch -50%]" if self.cfg.use_batch_api else ""),
+        ] + ([
+            f"  NOTE                 : {n_fail} failed decision(s) are charged "
+            f"latency but $0.00 in tokens -- the request was sent and billed, but "
+            f"no usage came back to measure. Treat the token line as a lower bound.",
+        ] if n_fail else []) + [
             f"  mean decision latency: {self.mean_latency_seconds():.2f} s",
             f"  signal decay at that latency: "
             f"{alpha_decay_factor(self.mean_latency_seconds(), self.cfg):.1%} of edge retained",
