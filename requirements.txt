@@ -6,3 +6,4 @@ flashtext
 requests
 python-dotenv
 tiktoken
+anthropic

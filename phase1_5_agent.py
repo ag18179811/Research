@@ -27,6 +27,12 @@ from execution_replay import (
     ReplayConfig,
 )
 
+# --- Coordination cost ------------------------------------------------------
+# One-way dependency: coordination_cost knows nothing about this module, so there
+# is no cycle. The SDK-to-meter key mapping lives there, next to the price table
+# that consumes it, rather than being restated at each call site.
+from coordination_cost import usage_from_anthropic
+
 # --- Claude ---------------------------------------------------------------
 import anthropic
 from dotenv import load_dotenv
@@ -80,6 +86,30 @@ You may place AT MOST ONE trade today. If nothing looks worth trading, return HO
 """.strip()
 
 
+# The stable half of every request: role, rules, and output schema. Byte-identical
+# across every decision in a run, which is the entire precondition for prompt
+# caching -- caching is a PREFIX match, so everything that varies day to day (the
+# date, the portfolio, the PiT payload) must come strictly AFTER this block. It
+# used to sit at the tail of _format_prompt, behind the trading date, which left
+# a cacheable prefix of exactly zero bytes.
+#
+# Whether this actually caches is a per-model question, not a property of the
+# text: it is ~200 tokens, which clears Claude Opus 5's 512-token minimum but is
+# far below Claude Haiku 4.5's 4096. Below the minimum there is no error and no
+# discount -- cache_creation_input_tokens simply comes back 0.
+# coordination_cost.cost_across_models() reports that per model rather than
+# assuming it away.
+SYSTEM_PROMPT = (
+    "You are a JSON-only API acting as a trading agent. Respond with exactly one "
+    "JSON object matching the requested schema and nothing else -- no markdown "
+    "code fences, no commentary before or after.\n\n"
+    "You may place at most ONE trade per day (or none). Use only the information "
+    "in the user message -- it is already point-in-time filtered; nothing in it "
+    "is from after the stated trading date.\n\n"
+    + DECISION_SCHEMA_HINT
+)
+
+
 # =============================================================================
 # The bridge
 # =============================================================================
@@ -88,21 +118,35 @@ class Phase15Bridge:
     def __init__(
         self,
         store: "dataprep.PointInTimeStore",
-        claude_api_key: str,
+        claude_api_key: str | None = None,
         tickers: list[str] | None = None,
-        model_name: str = "claude-haiku-4-5-20251001",
+        model_name: str = "claude-haiku-4-5",
         max_tokens: int = 1024,
         adv_window: int = 21,
         synthetic_spread_bps: float = 5.0,
+        use_prompt_caching: bool = True,
     ):
         self.store = store
         self.tickers = tickers or dataprep.EVALUATION_TICKERS
+        # Undated ID on purpose: this string is also the lookup key into
+        # coordination_cost.MODEL_PRICES, which is keyed on undated IDs. The old
+        # default ("claude-haiku-4-5-20251001") is a valid model but not a valid
+        # price key, so metering it raised KeyError on the first cost lookup.
         self.model_name = model_name
         self.max_tokens = max_tokens
         self.adv_window = adv_window
         self.synthetic_spread_bps = synthetic_spread_bps
+        self.use_prompt_caching = use_prompt_caching
+        # api_key=None lets the SDK resolve credentials itself (ANTHROPIC_API_KEY,
+        # ANTHROPIC_AUTH_TOKEN, or an `ant auth login` profile). Passing None is
+        # not the same as having no credentials.
         self.client = anthropic.Anthropic(api_key=claude_api_key)
         self._regime_series: pd.Series | None = None  # lazily built, cached
+        # Set by _call_llm from response.usage; read by CoordinationMeter via
+        # last_usage(). None until the first call, so an unused bridge reports
+        # nothing rather than a fabricated zero.
+        self._last_usage: dict | None = None
+        self._prefix_tokens: int = 0   # measured lazily by measure_prefix_tokens()
 
     # -- market-wide regime, computed once from SPY, never shown to the LLM --
     def _ensure_regime_series(self) -> None:
@@ -216,27 +260,66 @@ class Phase15Bridge:
                 f"return_on_assets={feats.get('return_on_assets')}, recent_news_count={len(tsnap['news'])}"
             )
 
-        lines += [
-            "",
-            "You are a trading agent. You may place at most ONE trade today "
-            "(or none). Use only the information above -- it is already "
-            "point-in-time filtered; nothing here is from after this date.",
-            DECISION_SCHEMA_HINT,
-        ]
+        # The role, the one-trade-per-day rule, and DECISION_SCHEMA_HINT used to be
+        # appended here. They now live in SYSTEM_PROMPT, ahead of this text, so the
+        # request has a stable cacheable prefix instead of leading with the trading
+        # date. Nothing stable belongs after this point.
         return "\n".join(lines)
+
+    # -- system block, with or without a cache breakpoint --------------------
+    def _system_blocks(self) -> list[dict]:
+        """SYSTEM_PROMPT as a content-block list, carrying a cache breakpoint when
+        caching is on. Sending it as blocks rather than a bare string is what makes
+        `cache_control` expressible at all."""
+        block: dict = {"type": "text", "text": SYSTEM_PROMPT}
+        if self.use_prompt_caching:
+            block["cache_control"] = {"type": "ephemeral"}
+        return [block]
+
+    def measure_prefix_tokens(self) -> int:
+        """Real token length of the cacheable prefix, via the Anthropic count_tokens
+        endpoint -- not tiktoken, which implements OpenAI's tokenizers and would give
+        a number for the wrong model family.
+
+        This drives the `prefix_caches` column in
+        coordination_cost.CoordinationMeter.cost_across_models(), which is the only
+        thing that will tell you a prefix silently fell below a model's minimum and
+        earned no discount at all. Measured once and cached; 0 if the call fails,
+        which reads downstream as "unknown" rather than as a false "yes it cached"."""
+        if self._prefix_tokens:
+            return self._prefix_tokens
+        try:
+            counted = self.client.messages.count_tokens(
+                model=self.model_name,
+                system=self._system_blocks(),
+                messages=[{"role": "user", "content": "x"}],
+            )
+            self._prefix_tokens = int(counted.input_tokens)
+        except Exception as exc:                     # network, auth, bad model id
+            log.warning("count_tokens failed (%s); prefix size unknown", exc)
+            self._prefix_tokens = 0
+        return self._prefix_tokens
+
+    # -- usage, in the shape CoordinationMeter expects -----------------------
+    def last_usage(self) -> dict | None:
+        """Token counts from the most recent call, keyed the way
+        coordination_cost.DecisionRecord names them. CoordinationMeter looks for
+        exactly this method (duck-typed) and falls back to assumed figures without
+        it. None before the first call."""
+        return self._last_usage
 
     # -- call Claude -------------------------------------------------------
     def _call_llm(self, prompt: str) -> dict:
         response = self.client.messages.create(
             model=self.model_name,
             max_tokens=self.max_tokens,
-            system=(
-                "You are a JSON-only API. Respond with exactly one JSON "
-                "object matching the requested schema and nothing else -- "
-                "no markdown code fences, no commentary before or after."
-            ),
+            system=self._system_blocks(),
             messages=[{"role": "user", "content": prompt}],
         )
+        # Record usage BEFORE parsing. A malformed-JSON response still cost real
+        # money, and losing the count because json.loads raised is exactly how a
+        # committee ends up looking cheaper than it was.
+        self._last_usage = usage_from_anthropic(response)
         text = "".join(block.text for block in response.content if block.type == "text").strip()
         try:
             return json.loads(text)
