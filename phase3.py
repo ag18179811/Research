@@ -16,12 +16,10 @@ Sections, in pipeline order:
                                or consumes.
   2. Episode runner         -- drives an AgentFn through episodes day by day
                                (Phase 1 snapshots in, Phase 2 fills out).
-  3. Baseline agent          -- buy_and_hold, the passive benchmark referenced
-                               throughout the proposal's metrics section.
-  4. TradingAgents adapter  -- wires TauricResearch/TradingAgents into the
+  3. TradingAgents adapter  -- wires TauricResearch/TradingAgents into the
                                AgentFn interface, patching three temporal-
                                integrity gaps found by reading its source.
-  5. Joint Metric Report    -- temporal integrity / regime robustness /
+  4. Joint Metric Report    -- temporal integrity / regime robustness /
                                executable performance / factor attribution,
                                computed from EpisodeRun objects Phase 1 and
                                Phase 2 already produced (no re-simulation).
@@ -292,40 +290,7 @@ def run_all_episodes(
 
 
 # ---------------------------------------------------------------------------
-# 3. Baseline agent (passive benchmark, per the proposal's Experimental Setup)
-# ---------------------------------------------------------------------------
-
-
-def buy_and_hold_agent_factory(tickers: list[str], notional_per_ticker: float = 10_000.0) -> AgentFn:
-    """Buys once on the first day it's called for each ticker, then never
-    trades again. This is the passive benchmark referenced throughout the
-    proposal's metrics section (e.g. "if just buying the S&P 500 made 12%
-    and your agent made 4%, your system is bad")."""
-    bought: set[str] = set()
-
-    def agent(decision_snapshots, positions, cash, as_of) -> list[Order]:
-        orders = []
-        for t in tickers:
-            if t in bought:
-                continue
-            snap = decision_snapshots.get(t, {})
-            prices = snap.get("prices")
-            if prices is None or prices.empty:
-                continue
-            last_close = float(prices.sort_values("date").iloc[-1]["adj_close"])
-            if last_close <= 0:
-                continue
-            qty = notional_per_ticker / last_close
-            orders.append(Order(order_id="", timestamp=as_of.isoformat(), symbol=t,
-                                 side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=qty))
-            bought.add(t)
-        return orders
-
-    return agent
-
-
-# ---------------------------------------------------------------------------
-# 4. TradingAgents adapter
+# 3. TradingAgents adapter
 # ---------------------------------------------------------------------------
 # Wires TauricResearch/TradingAgents into the AgentFn interface above,
 # applying three fixes identified from actually reading the vendored source:
@@ -628,7 +593,7 @@ def build_trading_agents_adapter(ta_graph, tickers: list[str], notional_per_tick
 
 
 # ---------------------------------------------------------------------------
-# 5. Joint Metric Report
+# 4. Joint Metric Report
 # ---------------------------------------------------------------------------
 # Aggregates EpisodeRun objects into the four report categories described in
 # the proposal's Joint Metric Collection Phase:

@@ -41,9 +41,11 @@ log = logging.getLogger("main")
 PROJECT_DIR = Path(__file__).resolve().parent
 RUNS_DIR = PROJECT_DIR / "runs"
 
-# The passive-benchmark control group from phase3.py. `llm` is handled
-# separately (see _build_agent) because it is not currently runnable.
-BASELINE_AGENTS = ("buy_and_hold",)
+# No standing passive-baseline agent exists any more (buy_and_hold was
+# removed) -- `llm` is currently the only runnable agent. Kept as a tuple,
+# not a bare string constant, so cmd_all's loop and any future non-LLM
+# baseline slot in cleanly.
+BASELINE_AGENTS = ()
 AGENT_CHOICES = BASELINE_AGENTS + ("llm",)
 
 # Cheapest rung of the current ladder, and the one this pipeline was already
@@ -60,15 +62,8 @@ DEFAULT_MODEL = "claude-haiku-4-5"
 
 def _build_agent(name: str, tickers: list[str], seed: int = 0,
                  model: str = DEFAULT_MODEL, use_prompt_caching: bool = True):
-    """Returns a phase3.AgentFn for `name`. Baselines come straight from
-    phase3.py; `llm` is the Anthropic-backed Phase 1.5 agent (see _LLMAgent).
-    `model` and `use_prompt_caching` are ignored by the baselines, which make
-    no API calls and therefore cost nothing to run."""
-    import phase3  # local import: pulls in numpy/pandas, not needed for `data`
-
-    if name == "buy_and_hold":
-        return phase3.buy_and_hold_agent_factory(tickers)
-
+    """Returns a phase3.AgentFn for `name`. `llm` (the only agent currently
+    wired up) is the Anthropic-backed Phase 1.5 agent -- see _LLMAgent."""
     if name == "llm":
         return _build_llm_agent(tickers, model=model,
                                 use_prompt_caching=use_prompt_caching)
@@ -574,13 +569,17 @@ def cmd_report(args) -> int:
 
     baseline = args.baseline
     if baseline not in reports:
-        # CBS is measured against a passive benchmark; fall back to whatever
-        # is actually present rather than failing the whole report.
-        fallback = "buy_and_hold" if "buy_and_hold" in reports else next(iter(reports), None)
+        # CBS is measured against a reference system; fall back to whatever
+        # is actually present rather than failing the whole report. There is
+        # no standing passive baseline agent any more (buy_and_hold was
+        # removed), so --baseline defaults to None and this fallback is the
+        # normal path, not an edge case.
+        fallback = next(iter(reports), None)
         if fallback is None:
             log.warning("no baseline available; skipping leaderboard")
             return 0
-        log.warning("baseline %r not among runs; using %r", baseline, fallback)
+        if baseline is not None:
+            log.warning("baseline %r not among runs; using %r", baseline, fallback)
         baseline = fallback
 
     leaderboard = comparison.build_leaderboard(
@@ -696,8 +695,10 @@ def _add_report_args(p) -> None:
     p.add_argument("--factors", default=None,
                    help="CSV of daily mkt/smb/hml; omitted = real Ken French factors "
                         "if `data build` fetched them, else SPY proxy (warns)")
-    p.add_argument("--baseline", default="buy_and_hold",
-                   help="system that CBS is measured against")
+    p.add_argument("--baseline", default=None,
+                   help="system that CBS is measured against; default: whichever "
+                        "run is loaded first (no standing passive baseline agent "
+                        "exists any more)")
     p.add_argument("--n-boot", type=int, default=1000)
 
 
