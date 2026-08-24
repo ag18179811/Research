@@ -971,6 +971,108 @@ def load_factors() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# VIX and objective crisis-window identification
+# ---------------------------------------------------------------------------
+# label_regimes' walk-forward HMM (fit on SPY return + realized vol) is the
+# regime labeler every episode actually gets tagged with -- this section
+# does NOT replace or feed into it. It exists because the HMM's majority-
+# vote-per-90-day-window design makes "crisis" structurally rare at that
+# granularity: across the full 2010-2024 range it produces exactly 2 crisis
+# episodes out of 49, an unavoidable consequence of a 3-state model
+# smoothed over long windows, not a bug. CBOE's own VIX is a second,
+# independent, far more commonly used market-stress signal that can supply
+# additional, explicitly-defined crisis windows to specifically test
+# against -- run as supplementary episodes (see run_regime_episodes.py),
+# not as a replacement for the HMM's own labels on the standard sweep.
+
+VIX_DIR = PROCESSED_DIR / "vix"
+VIX_HISTORY_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
+
+
+def build_vix(url: str = VIX_HISTORY_URL) -> None:
+    """Downloads CBOE's own official daily VIX history into data/processed/vix.
+    Free, no auth, no vendor gating -- CBOE publishes this CSV directly."""
+    import subprocess
+
+    result = subprocess.run(["curl", "-sL", url], capture_output=True, check=True)
+    df = pd.read_csv(io.StringIO(result.stdout.decode("utf-8")))
+    df.columns = [c.strip().lower() for c in df.columns]
+    df["date"] = pd.to_datetime(df["date"], format="%m/%d/%Y", utc=True)
+    df = df.sort_values("date").reset_index(drop=True)
+
+    VIX_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(VIX_DIR / "data.parquet", index=False)
+    log.info("vix: %d daily observations, %s -> %s written",
+              len(df), df["date"].min().date(), df["date"].max().date())
+
+
+def load_vix() -> pd.DataFrame:
+    """Date-indexed frame with columns open/high/low/close (VIX index
+    points, not a return series -- no rescaling needed)."""
+    path = VIX_DIR / "data.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"no processed VIX data at {VIX_DIR}, run build-vix first")
+    return pd.read_parquet(path).set_index("date").sort_index()
+
+
+def find_vix_crisis_windows(
+    vix_threshold: float = 30.0,
+    merge_gap_days: int = 45,
+    min_high_vix_days: int = 5,
+    window_len: pd.Timedelta = EPISODE_WINDOW_LEN,
+    start: pd.Timestamp = EPISODE_RANGE_START,
+    end: pd.Timestamp = EPISODE_RANGE_END,
+) -> pd.DataFrame:
+    """Identifies major historical crisis periods from real VIX closes,
+    independent of label_regimes' HMM.
+
+    Methodology: days with VIX close > `vix_threshold` (30 is a standard,
+    widely-used "high fear" line -- not tuned to produce a target count).
+    Consecutive high-VIX days within `merge_gap_days` of each other are
+    merged into one cluster, so a crisis with a brief dip below threshold
+    partway through (COVID did this) still reads as one period, not two.
+    Clusters shorter than `min_high_vix_days` are dropped as noise spikes
+    rather than sustained crises (a 2-day VIX pop, e.g. a single surprise
+    macro print, isn't the "does the agent survive a real crisis" test this
+    is for).
+
+    Returns one row per surviving cluster: onset (first high-VIX day,
+    used as the episode start -- the crisis is already underway there, a
+    deliberately harder test than starting before it), last_spike, peak_vix,
+    n_high_vix_days, and a `window_len`-long [episode_start, episode_end)
+    candidate consistent with the rest of this pipeline's episode
+    convention, ready to hand to run_episode/run_all_episodes."""
+    vix = load_vix()
+    vix = vix[(vix.index >= pd.Timestamp(start)) & (vix.index < pd.Timestamp(end))]
+    dates = vix.index[vix["close"] > vix_threshold]
+    if len(dates) == 0:
+        return pd.DataFrame(columns=["onset", "last_spike", "peak_vix", "n_high_vix_days",
+                                      "episode_start", "episode_end"])
+
+    clusters, cur = [], [dates[0]]
+    for d in dates[1:]:
+        if (d - cur[-1]).days <= merge_gap_days:
+            cur.append(d)
+        else:
+            clusters.append(cur)
+            cur = [d]
+    clusters.append(cur)
+
+    rows = []
+    for c in clusters:
+        if len(c) < min_high_vix_days:
+            continue
+        onset = c[0]
+        rows.append({
+            "onset": onset, "last_spike": c[-1],
+            "peak_vix": float(vix.loc[c[0]:c[-1], "close"].max()),
+            "n_high_vix_days": len(c),
+            "episode_start": onset, "episode_end": onset + window_len,
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Entity resolution: SEC CIK <-> ticker crosswalk
 # ---------------------------------------------------------------------------
 # Prices/news are keyed by ticker; SEC fundamentals are keyed by CIK (SEC
@@ -1539,6 +1641,7 @@ def main() -> None:
     sub.add_parser("build-entity-map")
     sub.add_parser("build-news-entity-backfill")
     sub.add_parser("build-factors", help="Ken French daily 6-factor series (Mkt-RF/SMB/HML/RMW/CMA/Mom)")
+    sub.add_parser("build-vix", help="CBOE daily VIX history, for find_vix_crisis_windows()")
     sub.add_parser("build-all")
 
     p = sub.add_parser("build-intraday-bars", help="Alpaca minute/hour bars, ~2016+ only")
@@ -1571,6 +1674,8 @@ def main() -> None:
         build_news_entity_backfill()
     elif args.command == "build-factors":
         build_factors()
+    elif args.command == "build-vix":
+        build_vix()
     elif args.command == "build-intraday-bars":
         build_intraday_bars(args.tickers, args.start, args.end, timeframe=args.timeframe)
     elif args.command == "build-quotes":
