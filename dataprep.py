@@ -1192,6 +1192,36 @@ class PointInTimeStore:
             **compute_fundamental_ratios(fundamentals),
         }
 
+        # Explicit self-audit via check(), independent of _enforce_and_log's
+        # own filtering inside prices_as_of/news_as_of/fundamentals_as_of
+        # above. Be precise about what this does and doesn't catch: it uses
+        # the same `as_of` those loaders already filtered on, so it's a
+        # genuine regression test on _enforce_and_log's own comparison logic
+        # (a future `<` -> `<=` typo, a timezone-comparison bug, a caller
+        # that bypasses the loader and hands snapshot_as_of a
+        # pre-filtered-elsewhere frame) -- not a check on whether *this*
+        # call was even given the right `as_of` in the first place. That
+        # second class of bug (a caller using the wrong cutoff for what it's
+        # doing -- e.g. building an execution-time snapshot with the
+        # decision cutoff, which is exactly the bug phase1_5_agent.py's
+        # run_episode had) needs a check on the *relationship* between two
+        # different cutoffs used in the same flow, not a self-check inside
+        # one call; see run_episode's own execution_cutoff assertion for
+        # that.
+        #
+        # What this does give: it's what makes Temporal Integrity's
+        # PASS/FAIL verdict (this check -> phase3.temporal_integrity_report)
+        # a real, falsifiable signal instead of a label nothing could ever
+        # flip to FAIL -- check() was previously defined but never called
+        # anywhere in the pipeline, so explicit_check_violations was always
+        # 0 by construction, not by verification.
+        available_ats = [
+            df["available_at"] for df in (prices, news, fundamentals)
+            if df is not None and not df.empty and "available_at" in df.columns
+        ]
+        if available_ats:
+            self.check(f"decision_snapshot:{ticker}", as_of, pd.concat(available_ats, ignore_index=True))
+
         return {"ticker": ticker, "cik": cik, "as_of": as_of,
                 "prices": prices, "news": news, "fundamentals": fundamentals,
                 "derived_features": derived_features}

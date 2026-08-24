@@ -536,6 +536,19 @@ def run_episode(
         # admits today's close. Standard T-1-decide/T-execute backtest
         # design; see _mark_to_market_prices for the full rationale.
         execution_cutoff = day + pd.Timedelta(days=1)
+        # Structural invariant, not a data-content check (store.check() is
+        # for that) -- asserts the *relationship* between the two cutoffs
+        # used in this loop is still correct. A future edit that
+        # accidentally reused `day` for execution again (the exact bug
+        # already found once here) would silently lag every fill/mark by a
+        # trading day with no error; this turns that into an immediate,
+        # loud failure instead of a subtly-wrong number someone has to
+        # notice by hand.
+        assert execution_cutoff > day, (
+            f"execution_cutoff ({execution_cutoff}) must be strictly after the decision "
+            f"cutoff `day` ({day}) -- execution/mark-to-market would otherwise use data "
+            f"from at-or-before the decision cutoff instead of today's own close"
+        )
 
         order = bridge._decision_to_order(decision, day, order_seq=i)
         if order is not None:
