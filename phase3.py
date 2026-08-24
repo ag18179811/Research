@@ -282,6 +282,12 @@ def run_all_episodes(
             log.warning("skipping episode %s..%s -- no regime label (insufficient HMM history)",
                         ep_start, ep_end)
             continue
+        # Duck-typed, not every AgentFn has state to clear (buy_and_hold's
+        # closure doesn't) -- but one that does (e.g. _LLMAgent's trade
+        # history, fed into its own prompt for narrative continuity) must
+        # not carry state across a purge gap into an unrelated episode.
+        if hasattr(agent_fn, "reset"):
+            agent_fn.reset()
         store = store_factory()
         run = run_episode(agent_fn, store, tickers, ep_start, ep_end, regime, replay_config)
         runs.append(run)
