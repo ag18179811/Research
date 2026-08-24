@@ -29,6 +29,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -104,7 +105,7 @@ class _LLMAgent:
     second running total would silently diverge from it.
     """
 
-    def __init__(self, tickers: list[str], model: str,
+    def __init__(self, tickers: list[str], model: str, api_key: str,
                  use_prompt_caching: bool = True):
         import dataprep as _dataprep
         import phase1_5_agent
@@ -115,6 +116,7 @@ class _LLMAgent:
         # and never shown to the LLM); snapshots come from phase3.run_episode.
         self.bridge = phase1_5_agent.Phase15Bridge(
             store=_dataprep.PointInTimeStore(),
+            claude_api_key=api_key,
             tickers=tickers,
             model_name=model,
             use_prompt_caching=use_prompt_caching,
@@ -186,6 +188,24 @@ def _build_llm_agent(tickers: list[str], model: str,
             "(it is in requirements.txt)"
         )
 
+    # Explicit, not left to the SDK's own ANTHROPIC_API_KEY auto-detection --
+    # this repo's .env has always used CLAUDE_API_KEY (phase1_5_agent.py's
+    # own standalone `main()` reads the same variable), and letting the SDK
+    # silently look for a differently-named var meant this path failed deep
+    # inside anthropic._base_client's header validation, mid-episode, with
+    # an error that never mentions CLAUDE_API_KEY at all.
+    #
+    # load_dotenv() here, not just relying on phase1_5_agent's own
+    # module-level call, because that module hasn't been imported yet at
+    # this point (only _LLMAgent.__init__ imports it) -- without this,
+    # os.environ.get below runs before .env has ever been read into the
+    # environment and always misses even when the key is genuinely set.
+    from dotenv import load_dotenv
+    load_dotenv()
+    api_key = os.environ.get("CLAUDE_API_KEY")
+    if not api_key:
+        raise SystemExit("--agent llm needs CLAUDE_API_KEY set in your environment (.env is fine)")
+
     from coordination_cost import MODEL_PRICES
     if model not in MODEL_PRICES:
         raise SystemExit(
@@ -194,7 +214,7 @@ def _build_llm_agent(tickers: list[str], model: str,
             f"rather than guessing.\nKnown: {', '.join(sorted(MODEL_PRICES))}"
         )
 
-    return _LLMAgent(tickers, model=model, use_prompt_caching=use_prompt_caching)
+    return _LLMAgent(tickers, model=model, api_key=api_key, use_prompt_caching=use_prompt_caching)
 
 
 # ---------------------------------------------------------------------------
