@@ -919,14 +919,14 @@ class JointMetricReport:
         lines = [
             f"=== Joint Metric Report: {self.system_name} ===",
             "",
-            "-- Temporal Integrity --",
-            f"clean: {ti.clean}  (explicit check() violations: {ti.explicit_check_violations})",
+            f"-- Temporal Integrity: {'PASS' if ti.clean else 'FAIL'} --",
             f"  [informational] {ti.total_rows_blocked} rows filtered out as future-dated / "
             f"{ti.total_rows_returned} returned across {ti.total_queries} loader queries "
             f"-- this is the PiT filter operating normally, not a leak",
         ]
         if not ti.clean:
-            lines.append(f"  episodes with explicit check() violations: {ti.checked_episodes}")
+            lines.append(f"  FAIL reason: {ti.explicit_check_violations} explicit check() "
+                          f"violation(s) in episode(s): {ti.checked_episodes}")
         lines += [
             "",
             "-- Regime Robustness --",

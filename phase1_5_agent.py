@@ -455,16 +455,31 @@ def trading_calendar(start: pd.Timestamp, n_days: int) -> list[pd.Timestamp]:
     return list(dates.iloc[:n_days])
 
 
-def _closing_prices(snap: dict) -> dict[str, float]:
-    """Last-close price per ticker from a universe snapshot -- used to
-    mark the engine's positions to market on days with no trade, so the
-    daily_portfolio_log has no gaps (needed for Phase 3's Sharpe/Sortino/
-    max-drawdown, which read that series)."""
+def _mark_to_market_prices(store: "dataprep.PointInTimeStore", tickers: list[str],
+                            as_of: pd.Timestamp) -> dict[str, float]:
+    """Every held ticker's actual close on the day being marked -- deliberately
+    NOT the decision snapshot's prices. The decision snapshot is (correctly)
+    filtered to strictly before today, since the agent must decide before
+    today's close exists; reusing it to mark today's portfolio value would
+    price today's positions off yesterday's close, silently shifting the
+    entire daily-return series by one trading day (this is what execute-on-
+    T-close means in the standard T-1-decide/T-execute backtest design
+    execution_harness.py already follows -- this function makes run_episode's
+    own loop follow it too). Pass `as_of = day + 1 trading-day's worth of
+    time (a full calendar day is enough, since PiT filtering is `< as_of`
+    and the next real trading day's own close is always further out) so the
+    PiT cutoff admits today's close but nothing from tomorrow onward.
+
+    A separate, prices-only fetch rather than reusing/rebuilding the full
+    per-ticker snapshot (news + fundamentals + derived features) that
+    build_daily_snapshot assembles -- mark-to-market only ever needs
+    adj_close, and re-fetching the rest for all tickers every day would
+    roughly double this loop's non-LLM cost for nothing this function reads."""
     out = {}
-    for ticker, tsnap in snap["tickers"].items():
-        prices = tsnap["prices"]
+    for t in tickers:
+        prices = store.prices_as_of(as_of, entities=[t])
         if not prices.empty:
-            out[ticker] = float(prices.sort_values("date")["adj_close"].iloc[-1])
+            out[t] = float(prices.sort_values("date")["adj_close"].iloc[-1])
     return out
 
 
@@ -514,9 +529,17 @@ def run_episode(
             reasoning=decision.get("reasoning", ""),
         )
 
+        # Execution and mark-to-market both need TODAY's own close -- unlike
+        # `day` (the decision cutoff, correctly strictly-before-today so the
+        # agent never sees its own close before deciding), `execution_cutoff`
+        # is one calendar day later so PiT filtering (`available_at < as_of`)
+        # admits today's close. Standard T-1-decide/T-execute backtest
+        # design; see _mark_to_market_prices for the full rationale.
+        execution_cutoff = day + pd.Timedelta(days=1)
+
         order = bridge._decision_to_order(decision, day, order_seq=i)
         if order is not None:
-            market_snapshot = bridge._decision_to_market_snapshot(decision["symbol"], day)
+            market_snapshot = bridge._decision_to_market_snapshot(decision["symbol"], execution_cutoff)
             fill = engine.process_order(order, market_snapshot)
             log.info(
                 "%s: %s %s -- requested %.2f, filled %.2f @ $%.4f (fee $%.4f, maker=%s) -- %s",
@@ -529,8 +552,11 @@ def run_episode(
 
         # Mark to market every day, trade or not, so the daily value series
         # has no gaps -- this is what Phase 3's Sharpe/Sortino/max-drawdown
-        # calculations read.
-        engine.record_daily_value(record.date, _closing_prices(snap))
+        # calculations read. Uses today's own close (execution_cutoff), not
+        # the decision snapshot `snap` -- see _mark_to_market_prices.
+        engine.record_daily_value(
+            record.date, _mark_to_market_prices(bridge.store, bridge.tickers, execution_cutoff)
+        )
         history.append(record)
 
     return engine, history
