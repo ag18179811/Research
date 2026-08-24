@@ -859,34 +859,62 @@ def load_corporate_actions(entities: list[str] | None = None) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Fama-French factor returns: Ken French Data Library
+# Factor returns: Ken French Data Library
 # ---------------------------------------------------------------------------
-# The market/size/value factor series phase3.factor_attribution regresses
-# agent returns against, per the proposal's Attribution phase. Without this,
-# main.py's load_factor_returns() falls back to a degenerate SPY-only proxy
-# that cannot identify beta_size/beta_value at all -- see that function's
-# docstring for the full priority order (--factors FILE > this > proxy).
+# The style factor series phase3.factor_attribution regresses agent returns
+# against, per the proposal's Attribution phase. Without this, main.py's
+# load_factor_returns() falls back to a degenerate SPY-only proxy that can
+# only identify beta_mkt -- see that function's docstring for the full
+# priority order (--factors FILE > this > proxy).
+#
+# Two files, both from the same library, merged into one table:
+#   - Fama/French 5 Factors (2x3) [Daily]: Mkt-RF, SMB, HML, RMW
+#     (profitability), CMA (investment), RF. Used as the base rather than
+#     also pulling the plain 3-factor file -- the 5-factor SMB is
+#     reconstructed from a different portfolio sort (controlling for
+#     profitability/investment too) than the 3-factor SMB, so mixing the two
+#     files' SMB/HML together would silently combine two inconsistent
+#     constructions. History starts 1963-07-01 (a few decades later than the
+#     3-factor file's 1926 start -- profitability/investment need
+#     balance-sheet data unavailable before Compustat coverage), still far
+#     more than any episode range this pipeline uses needs.
+#   - Momentum Factor (Mom) [Daily]: MOM, a sixth, independently well-
+#     documented style factor (Carhart's addition to Fama-French), not part
+#     of either the 3- or 5-factor files.
+# Together: the standard Fama-French-Carhart 6-factor set.
 
 FACTORS_DIR = PROCESSED_DIR / "factors"
-FAMA_FRENCH_DAILY_3_FACTOR_URL = (
+FAMA_FRENCH_5_FACTOR_DAILY_URL = (
     "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/"
-    "ftp/F-F_Research_Data_Factors_daily_CSV.zip"
+    "ftp/F-F_Research_Data_5_Factors_2x3_daily_CSV.zip"
+)
+FAMA_FRENCH_MOMENTUM_DAILY_URL = (
+    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/"
+    "ftp/F-F_Momentum_Factor_daily_CSV.zip"
 )
 
+# Every canonical factor column this pipeline knows about, in the fixed
+# order phase3.factor_attribution reports betas -- "mkt" is the only one
+# treated as required (see factor_attribution); everything else is used
+# if present, so a --factors FILE with fewer columns or the SPY-only proxy
+# (mkt alone) still work, just with fewer betas identified.
+FACTOR_COLUMNS = ("mkt", "smb", "hml", "rmw", "cma", "mom")
 
-def build_factors(url: str = FAMA_FRENCH_DAILY_3_FACTOR_URL) -> None:
-    """Downloads Ken French's daily 3-factor series (Mkt-RF/SMB/HML/RF) from
-    the Fama/French Data Library into data/processed/factors.
 
-    The published CSV isn't uniform, plain tabular data: it opens with a few
-    lines of free-text metadata (which CRSP vintage built the file, a note
-    about the risk-free rate source) and closes with a blank line and a
-    copyright notice, wrapped around the actual `date,Mkt-RF,SMB,HML,RF`
-    table. Rather than skip a fixed number of header/footer lines -- fragile
-    against Ken French revising the preamble, which has already happened
-    once (Flat File Format 2.0 in 2025) -- every line is matched against
-    `^\\d{8},` (an 8-digit YYYYMMDD date followed by a comma) and only those
-    are treated as data.
+def _fetch_ken_french_csv(url: str, value_names: list[str]) -> pd.DataFrame:
+    """Downloads one Ken French daily CSV zip and returns a
+    [date, *value_names] frame, decimal-scaled (source is percent, e.g.
+    0.53 == 0.53%).
+
+    The published CSVs aren't uniform, plain tabular data: they open with
+    a few lines of free-text metadata (which CRSP vintage built the file,
+    methodology notes) and close with a blank line and a copyright notice,
+    wrapped around the actual `date,<factors...>` table. Rather than skip a
+    fixed number of header/footer lines -- fragile against Ken French
+    revising the preamble, which has already happened once (Flat File
+    Format 2.0 in 2025) -- every line is matched against `^\\d{8},` (an
+    8-digit YYYYMMDD date followed by a comma) and only those are treated
+    as data.
 
     Uses curl rather than urllib/requests: see build_entity_map's own note
     on this machine's broken local CA bundle."""
@@ -902,26 +930,39 @@ def build_factors(url: str = FAMA_FRENCH_DAILY_3_FACTOR_URL) -> None:
         raise ValueError(f"no data rows found in {url} -- Ken French may have changed the file format")
 
     df = pd.read_csv(io.StringIO("\n".join(data_lines)), header=None,
-                      names=["date", "mkt", "smb", "hml", "rf"])
+                      names=["date", *value_names])
     df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", utc=True)
-    # Published in percent (0.53 == 0.53%); factor_attribution regresses
-    # against decimal portfolio returns, so convert once here rather than
-    # relying on every consumer to notice and rescale.
-    for c in ("mkt", "smb", "hml", "rf"):
+    for c in value_names:
         df[c] = df[c].astype(float) / 100.0
-    df = df.sort_values("date").reset_index(drop=True)
+    return df
+
+
+def build_factors() -> None:
+    """Downloads Ken French's daily 5-factor series and the daily momentum
+    factor from the Fama/French Data Library, merges them into one table,
+    and writes it to data/processed/factors."""
+    five = _fetch_ken_french_csv(FAMA_FRENCH_5_FACTOR_DAILY_URL,
+                                  ["mkt", "smb", "hml", "rmw", "cma", "rf"])
+    mom = _fetch_ken_french_csv(FAMA_FRENCH_MOMENTUM_DAILY_URL, ["mom"])
+
+    # Inner join: momentum's own history runs back to 1926, far earlier than
+    # the 5-factor file's 1963 start, so this is bounded by the 5-factor
+    # file's range, not narrowed by momentum.
+    df = five.merge(mom, on="date", how="inner").sort_values("date").reset_index(drop=True)
+    df = df[["date", *FACTOR_COLUMNS, "rf"]]
 
     FACTORS_DIR.mkdir(parents=True, exist_ok=True)
     df.to_parquet(FACTORS_DIR / "data.parquet", index=False)
-    log.info("factors: %d daily Fama-French 3-factor observations, %s -> %s written",
+    log.info("factors: %d daily Fama-French-Carhart 6-factor observations, %s -> %s written",
               len(df), df["date"].min().date(), df["date"].max().date())
 
 
 def load_factors() -> pd.DataFrame:
-    """Date-indexed ["mkt","smb","hml"] frame, decimal-scaled, ready for
-    phase3.factor_attribution / phase3.block_bootstrap_ci(metric="alpha").
-    `rf` is kept as an extra column (not required by those callers) for
-    anyone who wants true excess-return regressions later."""
+    """Date-indexed frame with columns FACTOR_COLUMNS (mkt/smb/hml/rmw/cma/
+    mom), decimal-scaled, ready for phase3.factor_attribution /
+    phase3.block_bootstrap_ci(metric="alpha"). `rf` is kept as an extra
+    column (not required by those callers) for anyone who wants true
+    excess-return regressions later."""
     path = FACTORS_DIR / "data.parquet"
     if not path.exists():
         raise FileNotFoundError(f"no processed factors at {FACTORS_DIR}, run build-factors first")
@@ -1467,7 +1508,7 @@ def main() -> None:
 
     sub.add_parser("build-entity-map")
     sub.add_parser("build-news-entity-backfill")
-    sub.add_parser("build-factors", help="Ken French daily 3-factor series (Mkt-RF/SMB/HML/RF)")
+    sub.add_parser("build-factors", help="Ken French daily 6-factor series (Mkt-RF/SMB/HML/RMW/CMA/Mom)")
     sub.add_parser("build-all")
 
     p = sub.add_parser("build-intraday-bars", help="Alpaca minute/hour bars, ~2016+ only")

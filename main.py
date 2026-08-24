@@ -203,27 +203,30 @@ def _build_llm_agent(tickers: list[str], model: str,
 
 
 def load_factor_returns(path: str | None) -> pd.DataFrame:
-    """Returns the date-indexed ["mkt","smb","hml"] frame that
-    phase3.factor_attribution() regresses against. Three-tier priority:
+    """Returns the date-indexed factor-returns frame that
+    phase3.factor_attribution() regresses against -- at minimum a "mkt"
+    column, plus whichever of dataprep.FACTOR_COLUMNS (smb/hml/rmw/cma/mom)
+    are available. Three-tier priority:
 
-      --factors FILE   an explicit override -- any 3-factor daily CSV
-                       (Ken French format or equivalent), highest priority
-                       so you can substitute a vetted/custom series.
+      --factors FILE   an explicit override -- any daily factor CSV (Ken
+                       French format or equivalent) with at least a mkt
+                       column, highest priority so you can substitute a
+                       vetted/custom series. Fewer columns than the full
+                       6-factor build just means fewer betas get identified
+                       -- factor_attribution adapts to whatever is present.
 
-      (omitted, and    the real thing: Ken French's own daily 3-factor
-       data/processed/  series, downloaded and parsed by
-       factors/ exists) dataprep.build_factors() (`python main.py data
+      (omitted, and    the real thing: Ken French's own daily
+       data/processed/  Fama-French-Carhart 6-factor series (mkt/smb/hml/
+       factors/ exists) rmw/cma/mom), downloaded and parsed by
+                       dataprep.build_factors() (`python main.py data
                        build` runs this) -- see dataprep.load_factors.
 
-      (omitted, and    a SPY-only proxy: mkt = SPY daily returns,
-       factors were     smb = hml = 0. beta_market stays meaningful; beta_size
-       never built)     and beta_value are regressed against a column of
-                       zeros and are therefore NOT identified -- an
-                       artifact, not a measurement. Alpha absorbs all
-                       size/value exposure. Warns loudly precisely so it
-                       never gets quietly reported as a genuine three-factor
-                       attribution -- this is the last-resort path, not the
-                       default."""
+      (omitted, and    a SPY-only proxy: mkt = SPY daily returns, nothing
+       factors were     else. Only beta_mkt is identified; alpha absorbs
+       never built)     all size/value/profitability/investment/momentum
+                       exposure. Warns loudly precisely so it never gets
+                       quietly reported as a full factor-model attribution
+                       -- this is the last-resort path, not the default."""
     if path:
         df = pd.read_csv(path)
         df.columns = [c.strip().lower() for c in df.columns]
@@ -237,11 +240,11 @@ def load_factor_returns(path: str | None) -> pd.DataFrame:
         if "mkt" not in df.columns and "mkt-rf" in df.columns:
             df = df.rename(columns={"mkt-rf": "mkt"})
 
-        missing = [c for c in ("mkt", "smb", "hml") if c not in df.columns]
-        if missing:
-            raise ValueError(f"{path}: missing required column(s) {missing}")
+        if "mkt" not in df.columns:
+            raise ValueError(f"{path}: missing required column 'mkt' (or 'Mkt-RF')")
 
-        out = df.set_index("date")[["mkt", "smb", "hml"]].astype(float).sort_index()
+        present = [c for c in dataprep.FACTOR_COLUMNS if c in df.columns]
+        out = df.set_index("date")[present].astype(float).sort_index()
 
         # Ken French publishes these in percent (0.53 == 0.53%), while the
         # portfolio returns they get regressed against are decimals. Detect
@@ -272,15 +275,15 @@ def load_factor_returns(path: str | None) -> pd.DataFrame:
 
     log.warning(
         "\n" + "=" * 72 + "\n"
-        "USING PROXY FACTORS -- mkt = SPY returns, smb = hml = 0.\n"
-        "beta_size and beta_value are regressed against zero columns and are\n"
-        "NOT identified. Do not report them as a Fama-French 3-factor\n"
-        "attribution. Alpha here absorbs all size/value exposure.\n"
-        "Pass --factors FILE with real daily factors to fix this.\n"
+        "USING PROXY FACTORS -- mkt = SPY returns only, no other factors.\n"
+        "Only beta_mkt is identified; alpha absorbs all size/value/\n"
+        "profitability/investment/momentum exposure. Do not report this as\n"
+        "a full factor-model attribution.\n"
+        "Pass --factors FILE, or run `python main.py data build`, to fix this.\n"
         + "=" * 72
     )
 
-    return pd.DataFrame({"mkt": mkt, "smb": 0.0, "hml": 0.0})
+    return pd.DataFrame({"mkt": mkt})
 
 
 # ---------------------------------------------------------------------------

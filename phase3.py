@@ -56,6 +56,7 @@ from dataprep import (
     assign_episode_regimes,
     label_regimes,
     load_prices,
+    FACTOR_COLUMNS,
 )
 from execution_replay import (
     ExecutionReplayEngine,
@@ -785,12 +786,27 @@ def _ols_alpha_beta(y: np.ndarray, factors: np.ndarray) -> tuple[float, np.ndarr
     return float(coef[0]), coef[1:]
 
 
+def _available_factor_cols(factor_returns: pd.DataFrame) -> list[str]:
+    """Which of dataprep.FACTOR_COLUMNS (mkt/smb/hml/rmw/cma/mom, in that
+    canonical order) `factor_returns` actually has. "mkt" is the one
+    non-negotiable column -- a market beta is the minimum any attribution
+    needs to mean anything -- everything else is used if present, so this
+    same code path handles the full 6-factor build, a user-supplied
+    --factors FILE with fewer columns, and the SPY-only proxy (mkt alone)
+    without three separate implementations."""
+    cols = [c for c in FACTOR_COLUMNS if c in factor_returns.columns]
+    if "mkt" not in cols:
+        raise ValueError(
+            "factor_returns must include at least a 'mkt' column -- "
+            "market beta is the minimum needed for any attribution"
+        )
+    return cols
+
+
 @dataclass
 class AttributionResult:
     alpha_annualized: float
-    beta_market: float
-    beta_size: float
-    beta_value: float
+    betas: dict[str, float]  # factor name -> beta, only for factors actually regressed
     n_obs: int
 
 
@@ -799,30 +815,31 @@ def factor_attribution(
     factor_returns: pd.DataFrame,
     periods_per_year: int = TRADING_DAYS_PER_YEAR,
 ) -> AttributionResult:
-    """Regresses the agent's daily returns on daily Market/Size/Value factor
-    returns. `factor_returns` must be date-indexed with columns
-    ["mkt", "smb", "hml"] (e.g. Fama-French daily factors) covering at least
-    the same dates as `daily_returns`; you're responsible for sourcing that
-    series (Ken French data library or equivalent -- see dataprep.load_factor_returns)
-    and aligning its index timezone/frequency to the portfolio value series
-    before calling this.
+    """Regresses the agent's daily returns on daily style factor returns.
+    `factor_returns` must be date-indexed with at least a "mkt" column
+    (Market) -- "smb" (Size), "hml" (Value), "rmw" (Profitability), "cma"
+    (Investment), and "mom" (Momentum) are each included in the regression
+    if present, so this adapts to whatever factor set was actually sourced
+    (see dataprep.build_factors for the full 6-factor build, or
+    main.load_factor_returns for the --factors FILE / SPY-proxy fallbacks).
+    You're responsible for aligning its index timezone/frequency to the
+    portfolio value series before calling this.
 
     Alpha is annualized (daily alpha * periods_per_year) and reported as
     factor-adjusted residual performance, per the proposal's framing --
     this is NOT a claim of "genuine skill," just the return unexplained by
-    market/size/value exposure."""
-    aligned = pd.concat([daily_returns.rename("ret"), factor_returns[["mkt", "smb", "hml"]]],
+    whatever style factors were included."""
+    factor_cols = _available_factor_cols(factor_returns)
+    aligned = pd.concat([daily_returns.rename("ret"), factor_returns[factor_cols]],
                          axis=1, join="inner").dropna()
     if len(aligned) < 5:
         log.warning("factor_attribution: only %d aligned observations, results unreliable", len(aligned))
     y = aligned["ret"].to_numpy()
-    X = aligned[["mkt", "smb", "hml"]].to_numpy()
+    X = aligned[factor_cols].to_numpy()
     alpha, beta = _ols_alpha_beta(y, X)
     return AttributionResult(
         alpha_annualized=alpha * periods_per_year,
-        beta_market=float(beta[0]),
-        beta_size=float(beta[1]),
-        beta_value=float(beta[2]),
+        betas={name: float(b) for name, b in zip(factor_cols, beta)},
         n_obs=len(aligned),
     )
 
@@ -871,10 +888,11 @@ def block_bootstrap_ci(
     if metric == "alpha":
         if factor_returns is None:
             raise ValueError("factor_returns is required for metric='alpha'")
-        aligned = pd.concat([rets.rename("ret"), factor_returns[["mkt", "smb", "hml"]]],
+        factor_cols = _available_factor_cols(factor_returns)
+        aligned = pd.concat([rets.rename("ret"), factor_returns[factor_cols]],
                              axis=1, join="inner").dropna()
         rets_arr = aligned["ret"].to_numpy()
-        fac_arr = aligned[["mkt", "smb", "hml"]].to_numpy()
+        fac_arr = aligned[factor_cols].to_numpy()
         n = len(aligned)
 
         def point(r, f):
@@ -941,10 +959,8 @@ class JointMetricReport:
             "-- Attribution --",
             f"alpha (annualized): {self.alpha_ci.point_estimate:.4f}  "
             f"95% CI [{self.alpha_ci.ci_low:.4f}, {self.alpha_ci.ci_high:.4f}]",
-            f"beta_market={self.attribution.beta_market:.3f}  "
-            f"beta_size={self.attribution.beta_size:.3f}  "
-            f"beta_value={self.attribution.beta_value:.3f}  "
-            f"(n_obs={self.attribution.n_obs})",
+            "  " + "  ".join(f"beta_{name}={val:.3f}" for name, val in self.attribution.betas.items())
+            + f"  (n_obs={self.attribution.n_obs})",
         ]
         return "\n".join(lines)
 
