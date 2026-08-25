@@ -37,6 +37,7 @@ Raw sources (fetched live, need APCA_API_KEY_ID / APCA_API_SECRET_KEY in .env):
 from __future__ import annotations
 
 import argparse
+import functools
 import io
 import logging
 import re
@@ -214,6 +215,30 @@ def build_prices(limit_tickers: int | None = None) -> None:
     log.info("prices: done. %d tickers written, %d skipped", n_ok, n_bad)
 
 
+@functools.lru_cache(maxsize=None)
+def _read_parquet_cached(path: str) -> pd.DataFrame:
+    """Process-lifetime cache for a single parquet file read. Every
+    *_as_of loader re-reads its underlying file(s) on every single call --
+    e.g. snapshot_as_of calls prices_as_of once per ticker per trading day,
+    tens of thousands of times over a full episode sweep -- even though
+    nothing in a run's lifetime ever changes the on-disk dataset (only
+    build_prices/build_news/build_fundamentals do that, and nothing calls
+    those mid-run). Unbounded size is intentional: the set of distinct
+    files this pipeline ever touches is fixed by the ticker/quarter/year
+    universe, not unbounded.
+
+    Returns the SAME DataFrame object on every call for a given path --
+    every caller in this codebase treats loader output as read-only
+    (filtered/sorted/deduped via pandas ops that already return new
+    objects, never mutated with e.g. `df["col"] = ...` in place); keep it
+    that way, or a mutation would corrupt every other caller's view too.
+
+    If you ever rebuild a dataset and need fresh data within the same
+    process (not a normal workflow here -- every real run is a fresh
+    `python` invocation), call `_read_parquet_cached.cache_clear()`."""
+    return pd.read_parquet(path)
+
+
 def load_prices(entities: list[str] | None = None) -> pd.DataFrame:
     if not PRICES_DIR.exists():
         raise FileNotFoundError(f"no processed prices at {PRICES_DIR}, run build-prices first")
@@ -228,8 +253,11 @@ def load_prices(entities: list[str] | None = None) -> pd.DataFrame:
     # directory: the `entity=<ticker>` folder names look like hive
     # partitioning, which clashes with the `entity` column already stored
     # inside each file (dictionary-encoded partition column vs plain string
-    # column -> schema merge error).
-    return pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
+    # column -> schema merge error). Each ticker has its own dedicated
+    # file, so caching per-path (rather than per whole-call-signature, as
+    # load_news/load_fundamentals do below) is both simpler and correct
+    # regardless of how `entities` combines tickers across different calls.
+    return pd.concat([_read_parquet_cached(str(p)) for p in paths], ignore_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -511,18 +539,31 @@ def build_news_entity_backfill() -> None:
               total_tagged + total_matched, total_rows, total_tagged, total_matched)
 
 
+@functools.lru_cache(maxsize=None)
+def _load_news_cached(entities: tuple[str, ...] | None, years: tuple[int, ...] | None) -> pd.DataFrame:
+    # Push entity filtering down to the parquet read (row-group pruning)
+    # instead of materializing all 15.5M rows and filtering in pandas --
+    # matters at 16GB RAM, where the full table is expensive to hold. This
+    # is exactly why this cache is keyed by (entities, years) and stores
+    # each call's already-filtered result, unlike _read_parquet_cached's
+    # per-raw-file caching for prices -- caching the unfiltered 15.5M-row
+    # table itself would defeat the memory reasoning that pushdown exists
+    # for. Cache locality is still strong: snapshot_as_of's news_years
+    # only changes when `as_of` crosses a year boundary, so the same
+    # (ticker, years) key repeats for ~all of a calendar year's calls.
+    filters = []
+    if years:
+        filters.append(("year", "in", list(years)))
+    if entities:
+        filters.append(("entity", "in", list(entities)))
+    return pd.read_parquet(NEWS_DIR, filters=filters or None)
+
+
 def load_news(entities: list[str] | None = None, years: list[int] | None = None) -> pd.DataFrame:
     if not NEWS_DIR.exists():
         raise FileNotFoundError(f"no processed news at {NEWS_DIR}, run build-news first")
-    # Push entity filtering down to the parquet read (row-group pruning)
-    # instead of materializing all 15.5M rows and filtering in pandas --
-    # matters at 16GB RAM, where the full table is expensive to hold.
-    filters = []
-    if years:
-        filters.append(("year", "in", years))
-    if entities:
-        filters.append(("entity", "in", entities))
-    return pd.read_parquet(NEWS_DIR, filters=filters or None)
+    return _load_news_cached(tuple(entities) if entities else None,
+                              tuple(years) if years else None)
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +642,9 @@ def _trailing_quarters(as_of: pd.Timestamp, n_quarters: int) -> list[str]:
     return labels
 
 
-def load_fundamentals(entities: list[int] | None = None, quarters: list[str] | None = None) -> pd.DataFrame:
+@functools.lru_cache(maxsize=None)
+def _load_fundamentals_cached(entities: tuple[int, ...] | None,
+                               quarters: tuple[str, ...] | None) -> pd.DataFrame:
     if not FUNDAMENTALS_DIR.exists():
         raise FileNotFoundError(f"no processed fundamentals at {FUNDAMENTALS_DIR}, run build-fundamentals first")
     paths = sorted(FUNDAMENTALS_DIR.glob("quarter=*/data.parquet"))
@@ -616,8 +659,21 @@ def load_fundamentals(entities: list[int] | None = None, quarters: list[str] | N
     # `null` type there but `string` elsewhere), which breaks pyarrow's
     # cross-file schema unification when reading the directory as a whole.
     # Per-file reads still push the entity filter down to row-group pruning.
-    filters = [("entity", "in", entities)] if entities else None
+    #
+    # Cached per (entities, quarters) call signature -- like load_news, not
+    # per raw file -- since these files hold every filer's facts, not one
+    # per entity like prices, and caching the unfiltered version would mean
+    # holding far more per quarter in memory than any one snapshot needs.
+    # Locality is strong regardless: snapshot_as_of's fundamentals_lookback_
+    # quarters window only shifts when `as_of` crosses a calendar quarter,
+    # so the same key repeats for ~all of one quarter's trading days.
+    filters = [("entity", "in", list(entities))] if entities else None
     return pd.concat([pd.read_parquet(p, filters=filters) for p in paths], ignore_index=True)
+
+
+def load_fundamentals(entities: list[int] | None = None, quarters: list[str] | None = None) -> pd.DataFrame:
+    return _load_fundamentals_cached(tuple(entities) if entities else None,
+                                      tuple(quarters) if quarters else None)
 
 
 # ---------------------------------------------------------------------------
