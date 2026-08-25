@@ -927,6 +927,63 @@ def block_bootstrap_ci(
     return BootstrapCI(point_estimate=float(estimate), ci_low=float(lo), ci_high=float(hi), n_boot=n_boot)
 
 
+# Canonical factor-set sizes to ablate over, smallest to largest. Chosen to
+# match the field's own standard progression -- CAPM (Sharpe/Lintner) ->
+# Fama-French 3-factor (1993) -> Fama-French-Carhart 6-factor (1997/2015)
+# -- not an arbitrary subset.
+FACTOR_SPECS: dict[str, tuple[str, ...]] = {
+    "capm_1factor": ("mkt",),
+    "ff_3factor": ("mkt", "smb", "hml"),
+    "ff_carhart_6factor": ("mkt", "smb", "hml", "rmw", "cma", "mom"),
+}
+
+
+def factor_attribution_ablation(
+    daily_returns: pd.Series,
+    factor_returns: pd.DataFrame,
+    n_boot: int = 1000,
+    block_size: int = 21,
+    seed: int = 0,
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
+) -> pd.DataFrame:
+    """Runs factor_attribution + block_bootstrap_ci(metric="alpha") at each
+    of FACTOR_SPECS' factor-set sizes against the SAME underlying
+    factor_returns, so alpha's sign/significance can be checked against
+    whether it survives every specification or only shows up in one.
+
+    Per spec, ALL of that spec's columns must be present in
+    factor_returns or the spec is skipped entirely (e.g. a --factors FILE
+    that only ever had 3 columns can't run the 6-factor spec) -- unlike
+    factor_attribution's own graceful per-call degradation to whatever
+    subset is available, here a partial match would silently compare a
+    "6-factor" row that's actually only a 4-factor regression, defeating
+    the point of the ablation.
+
+    Explicitly NOT a second, independently-sourced dataset -- every spec
+    here still comes from whatever single factor_returns was passed in.
+    This answers "is this alpha robust to specification choice," not "is
+    this alpha robust to which vendor's factor construction you trust";
+    those are different, complementary questions."""
+    rows = []
+    for spec_name, wanted_cols in FACTOR_SPECS.items():
+        if not all(c in factor_returns.columns for c in wanted_cols):
+            continue
+        restricted = factor_returns[list(wanted_cols)]
+        attribution = factor_attribution(daily_returns, restricted, periods_per_year)
+        alpha_ci = block_bootstrap_ci(daily_returns, factor_returns=restricted, metric="alpha",
+                                       n_boot=n_boot, block_size=block_size, seed=seed)
+        rows.append({
+            "spec": spec_name,
+            "n_factors": len(wanted_cols),
+            "alpha_annualized": attribution.alpha_annualized,
+            "alpha_ci_low": alpha_ci.ci_low,
+            "alpha_ci_high": alpha_ci.ci_high,
+            "n_obs": attribution.n_obs,
+            **{f"beta_{name}": val for name, val in attribution.betas.items()},
+        })
+    return pd.DataFrame(rows)
+
+
 @dataclass
 class JointMetricReport:
     system_name: str
@@ -937,6 +994,7 @@ class JointMetricReport:
     sharpe_ci: BootstrapCI
     sortino_ci: BootstrapCI
     alpha_ci: BootstrapCI
+    attribution_ablation: pd.DataFrame  # alpha/betas at each FACTOR_SPECS size, see factor_attribution_ablation
 
     def summary(self) -> str:
         ti = self.temporal_integrity
@@ -968,6 +1026,13 @@ class JointMetricReport:
             "  " + "  ".join(f"beta_{name}={val:.3f}" for name, val in self.attribution.betas.items())
             + f"  (n_obs={self.attribution.n_obs})",
         ]
+        if not self.attribution_ablation.empty:
+            lines += [
+                "",
+                "-- Attribution ablation (same data, different factor-set sizes) --",
+                "  is alpha robust to specification choice, or an artifact of picking one?",
+                self.attribution_ablation.round(4).to_string(index=False),
+            ]
         return "\n".join(lines)
 
 
@@ -1000,6 +1065,8 @@ def build_joint_metric_report(
                                      block_size=block_size, seed=seed)
     alpha_ci = block_bootstrap_ci(all_returns, factor_returns=factor_returns, metric="alpha",
                                    n_boot=n_boot, block_size=block_size, seed=seed)
+    ablation = factor_attribution_ablation(all_returns, factor_returns, n_boot=n_boot,
+                                            block_size=block_size, seed=seed)
 
     return JointMetricReport(
         system_name=system_name,
@@ -1010,4 +1077,5 @@ def build_joint_metric_report(
         sharpe_ci=sharpe_ci,
         sortino_ci=sortino_ci,
         alpha_ci=alpha_ci,
+        attribution_ablation=ablation,
     )
