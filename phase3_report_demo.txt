@@ -1,0 +1,57 @@
+
+=== Joint Metric Report: llm ===
+
+-- Temporal Integrity: PASS --
+  [informational] 66042 rows filtered out as future-dated / 696006 returned across 162 loader queries -- this is the PiT filter operating normally, not a leak
+
+-- Regime Robustness --
+        regime  n_episodes  mean_net_return  mean_sharpe  std_sharpe  mean_sortino  mean_max_drawdown  mean_breakeven_bps
+mean_reverting           1      9092.672882     4.724626         NaN     10.053785           0.023416                 0.0
+
+-- Executable Performance (aggregate across episodes) --
+mean Sharpe:  4.725  95% CI [0.061, 7.900]
+mean Sortino: 10.054  95% CI [0.090, 22.082]
+
+-- Attribution --
+alpha (annualized): 0.0768  95% CI [-0.3191, 0.9794]
+  beta_mkt=0.813  beta_smb=-0.362  beta_hml=-0.582  beta_rmw=0.249  beta_cma=-1.452  beta_mom=-0.642  (n_obs=26)
+
+=== Agent System Leaderboard ===
+
+        pit_integrity  realistic_execution  market_impact  multi_seed_ci  regime_stratified    sharpe cbs_bps
+system                                                                                                       
+llm              True                 True           True           True              False  4.724626    None
+
+llm: baseline
+
+========================================================================
+COORDINATION COST
+========================================================================
+
+=== Coordination cost: llm ===
+  model                : Claude Haiku 4.5  ($1.0/$5.0 per MTok, anthropic docs (first-party API), verified 2026-08-14)
+  cache rates          : read $0.10 / write $1.25 per MTok (min cacheable prefix 4,096 tok)
+  billing              : caching on, batch off, TTL 5m
+  token counts         : MEASURED from the agent
+  decisions            : 27
+  LLM calls            : 27 (1.0 per decision)
+  input tokens         : 35,983 uncached / 0 cache-read / 0 cache-write
+  output tokens        : 3,753
+  inter-agent messages : 0
+  token cost (list)    : $0.05
+  token cost (billed)  : $0.05
+  mean decision latency: 8.00 s
+  signal decay at that latency: 100.0% of edge retained
+
+  same token volume, priced across the ladder (cost is a model-selection decision, not a constant):
+                                     model usd_per_mtok  cost_usd prefix_caches                           source
+                          Claude Haiku 4.5        $1/$5      0.05 NO (274<4096) anthropic docs (first-party API)
+    Claude Sonnet 5 (intro, to 2026-08-31)       $2/$10      0.11 NO (274<1024) anthropic docs (first-party API)
+                         Claude Sonnet 4.6       $3/$15      0.16 NO (274<1024) anthropic docs (first-party API)
+                           Claude Sonnet 5       $3/$15      0.16 NO (274<1024) anthropic docs (first-party API)
+                           Claude Opus 4.6       $5/$25      0.27 NO (274<1024) anthropic docs (first-party API)
+                           Claude Opus 4.7       $5/$25      0.27 NO (274<1024) anthropic docs (first-party API)
+                           Claude Opus 4.8       $5/$25      0.27 NO (274<1024) anthropic docs (first-party API)
+                             Claude Opus 5       $5/$25      0.27  NO (274<512) anthropic docs (first-party API)
+                            Claude Fable 5      $10/$50      0.55  NO (274<512) anthropic docs (first-party API)
+    NB: repricing swaps the RATE, not the tokenization. Models in a different tokenizer family would emit different counts for the same text; re-measure rather than trusting the swap.

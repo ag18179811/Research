@@ -106,7 +106,9 @@ class _LLMAgent:
     """
 
     def __init__(self, tickers: list[str], model: str, api_key: str,
-                 use_prompt_caching: bool = True):
+                 use_prompt_caching: bool = True, provider: str | None = None,
+                 azure_endpoint: str | None = None, deployment_name: str | None = None,
+                 max_tokens: int = 1024):
         import dataprep as _dataprep
         import phase1_5_agent
 
@@ -114,12 +116,26 @@ class _LLMAgent:
         self.model = model
         # The store is only needed for the bridge's regime series (built from SPY
         # and never shown to the LLM); snapshots come from phase3.run_episode.
+        # api_key is Anthropic's key when provider="anthropic" and the Azure
+        # Foundry project key when provider="azure" -- Phase15Bridge routes it
+        # to the right constructor arg based on `provider`.
         self.bridge = phase1_5_agent.Phase15Bridge(
             store=_dataprep.PointInTimeStore(),
-            claude_api_key=api_key,
+            claude_api_key=api_key if provider == "anthropic" else None,
             tickers=tickers,
             model_name=model,
             use_prompt_caching=use_prompt_caching,
+            provider=provider,
+            azure_endpoint=azure_endpoint,
+            # anthropic_foundry uses the azure_endpoint/azure_api_key slots
+            # too (same Foundry project credentials), NOT claude_api_key --
+            # Phase15Bridge's anthropic_foundry branch specifically requires
+            # azure_endpoint/azure_api_key to build AnthropicFoundry's
+            # base_url. Only plain "anthropic" (direct API) uses
+            # claude_api_key.
+            azure_api_key=api_key if provider in ("azure", "anthropic_foundry") else None,
+            deployment_name=deployment_name,
+            max_tokens=max_tokens,
         )
         self._PortfolioState = phase1_5_agent.PortfolioState
         self._TradeRecord = phase1_5_agent.TradeRecord
@@ -179,33 +195,10 @@ class _LLMAgent:
 
 def _build_llm_agent(tickers: list[str], model: str,
                      use_prompt_caching: bool = True) -> _LLMAgent:
-    """Constructs the Anthropic-backed agent, failing early and specifically."""
-    try:
-        import anthropic  # noqa: F401
-    except ImportError:
-        raise SystemExit(
-            "--agent llm needs the Anthropic SDK: pip install anthropic\n"
-            "(it is in requirements.txt)"
-        )
-
-    # Explicit, not left to the SDK's own ANTHROPIC_API_KEY auto-detection --
-    # this repo's .env has always used CLAUDE_API_KEY (phase1_5_agent.py's
-    # own standalone `main()` reads the same variable), and letting the SDK
-    # silently look for a differently-named var meant this path failed deep
-    # inside anthropic._base_client's header validation, mid-episode, with
-    # an error that never mentions CLAUDE_API_KEY at all.
-    #
-    # load_dotenv() here, not just relying on phase1_5_agent's own
-    # module-level call, because that module hasn't been imported yet at
-    # this point (only _LLMAgent.__init__ imports it) -- without this,
-    # os.environ.get below runs before .env has ever been read into the
-    # environment and always misses even when the key is genuinely set.
-    from dotenv import load_dotenv
-    load_dotenv()
-    api_key = os.environ.get("CLAUDE_API_KEY")
-    if not api_key:
-        raise SystemExit("--agent llm needs CLAUDE_API_KEY set in your environment (.env is fine)")
-
+    """Constructs the LLM-backed agent for `model`, failing early and
+    specifically. Provider (Anthropic vs. Azure AI Foundry) is looked up from
+    coordination_cost.MODEL_PRICES[model].provider -- one source of truth for
+    "what is this model and how do I bill it" is also "how do I call it"."""
     from coordination_cost import MODEL_PRICES
     if model not in MODEL_PRICES:
         raise SystemExit(
@@ -213,8 +206,72 @@ def _build_llm_agent(tickers: list[str], model: str,
             f"could not be priced. Add it with its source and verification date "
             f"rather than guessing.\nKnown: {', '.join(sorted(MODEL_PRICES))}"
         )
+    provider = MODEL_PRICES[model].provider
 
-    return _LLMAgent(tickers, model=model, api_key=api_key, use_prompt_caching=use_prompt_caching)
+    # load_dotenv() here, not just relying on phase1_5_agent's own
+    # module-level call, because that module hasn't been imported yet at
+    # this point (only _LLMAgent.__init__ imports it) -- without this,
+    # os.environ.get below runs before .env has ever been read into the
+    # environment and always misses even when the key is genuinely set.
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    if provider == "anthropic":
+        try:
+            import anthropic  # noqa: F401
+        except ImportError:
+            raise SystemExit(
+                "--agent llm needs the Anthropic SDK: pip install anthropic\n"
+                "(it is in requirements.txt)"
+            )
+        # Explicit, not left to the SDK's own ANTHROPIC_API_KEY auto-detection --
+        # this repo's .env has always used CLAUDE_API_KEY (phase1_5_agent.py's
+        # own standalone `main()` reads the same variable), and letting the SDK
+        # silently look for a differently-named var meant this path failed deep
+        # inside anthropic._base_client's header validation, mid-episode, with
+        # an error that never mentions CLAUDE_API_KEY at all.
+        api_key = os.environ.get("CLAUDE_API_KEY")
+        if not api_key:
+            raise SystemExit("--agent llm needs CLAUDE_API_KEY set in your environment (.env is fine)")
+        return _LLMAgent(tickers, model=model, api_key=api_key,
+                         use_prompt_caching=use_prompt_caching, provider="anthropic")
+
+    if provider == "azure":
+        endpoint = os.environ.get("AZURE_FOUNDRY_ENDPOINT")
+        api_key = os.environ.get("AZURE_FOUNDRY_API_KEY")
+        if not endpoint or not api_key:
+            raise SystemExit(
+                "--agent llm --model " + model + " needs AZURE_FOUNDRY_ENDPOINT and "
+                "AZURE_FOUNDRY_API_KEY set in your environment (.env is fine)"
+            )
+        import azure_llm
+        deployment_name = azure_llm.AZURE_DEPLOYMENT_NAMES.get(model, model)
+        max_tokens = azure_llm.AZURE_MAX_TOKENS_OVERRIDE.get(model, 1024)
+        return _LLMAgent(tickers, model=model, api_key=api_key,
+                         use_prompt_caching=use_prompt_caching, provider="azure",
+                         azure_endpoint=endpoint, deployment_name=deployment_name,
+                         max_tokens=max_tokens)
+
+    if provider == "anthropic_foundry":
+        # Same Foundry project as provider="azure" (same env vars), but a
+        # genuinely different wire format underneath -- see
+        # Phase15Bridge.__init__'s anthropic_foundry branch and
+        # coordination_cost.MODEL_PRICES["claude-opus-5-azure"]'s comment
+        # for why this isn't just another AZURE_DEPLOYMENT_NAMES entry.
+        endpoint = os.environ.get("AZURE_FOUNDRY_ENDPOINT")
+        api_key = os.environ.get("AZURE_FOUNDRY_API_KEY")
+        if not endpoint or not api_key:
+            raise SystemExit(
+                "--agent llm --model " + model + " needs AZURE_FOUNDRY_ENDPOINT and "
+                "AZURE_FOUNDRY_API_KEY set in your environment (.env is fine)"
+            )
+        import azure_llm
+        deployment_name = azure_llm.ANTHROPIC_FOUNDRY_DEPLOYMENT_NAMES.get(model, model)
+        return _LLMAgent(tickers, model=model, api_key=api_key,
+                         use_prompt_caching=use_prompt_caching, provider="anthropic_foundry",
+                         azure_endpoint=endpoint, deployment_name=deployment_name)
+
+    raise SystemExit(f"unknown provider {provider!r} for model {model!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -527,9 +584,10 @@ def cmd_backtest(args) -> int:
     )
 
     RUNS_DIR.mkdir(exist_ok=True)
-    out = RUNS_DIR / f"{args.agent}.json"
+    system_name = getattr(args, "system", None) or args.agent
+    out = RUNS_DIR / f"{system_name}.json"
     payload = {
-        "system": args.agent,
+        "system": system_name,
         "impact_gamma": args.impact_gamma,
         "episodes": [_episode_to_dict(r) for r in runs],
     }
@@ -684,6 +742,11 @@ def cmd_all(args) -> int:
 def _add_backtest_args(p) -> None:
     p.add_argument("--tickers", nargs="*", default=None,
                    help="default: dataprep.EVALUATION_TICKERS (20 names)")
+    p.add_argument("--system", default=None,
+                   help="output filename stem -- writes runs/<system>.json instead of "
+                        "runs/<agent>.json. Needed to run several models concurrently "
+                        "under --agent llm without them overwriting the same run file; "
+                        "`report --systems` reads by this same name. Default: --agent.")
     p.add_argument("--start", default=str(dataprep.EPISODE_RANGE_START.date()))
     p.add_argument("--end", default=str(dataprep.EPISODE_RANGE_END.date()))
     p.add_argument("--window-days", type=int, default=dataprep.EPISODE_WINDOW_LEN.days)

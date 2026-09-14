@@ -1,6 +1,15 @@
 .venv/
+venv/
 __pycache__/
 *.pyc
 data/
 .DS_Store
 .env
+TradingAgents/
+ta_memory/
+
+# Local editor config (contains machine-specific paths)
+Research.code-workspace
+
+# Run logs (regenerated on every run; 18MB+)
+*.log

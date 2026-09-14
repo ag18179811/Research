@@ -1,0 +1,27 @@
+
+=== Joint Metric Report: llm ===
+
+-- Temporal Integrity: PASS --
+  [informational] 426541 rows filtered out as future-dated / 1791208 returned across 492 loader queries -- this is the PiT filter operating normally, not a leak
+
+-- Regime Robustness --
+        regime  n_episodes  mean_net_return  mean_sharpe  std_sharpe  mean_sortino  mean_max_drawdown  mean_breakeven_bps
+        crisis           1    -23826.637268    -2.596639         NaN     -4.199724           0.263284                 0.0
+mean_reverting           1     -1049.673655    -0.514957         NaN     -1.272874           0.066800                 0.0
+      trending           1     13570.959418     4.676144         NaN      6.286043           0.052067                 0.0
+
+-- Executable Performance (aggregate across episodes) --
+mean Sharpe:  -0.664  95% CI [-2.287, 2.886]
+mean Sortino: -0.809  95% CI [-3.202, 4.685]
+
+-- Attribution --
+alpha (annualized): 0.2103  95% CI [-0.3007, 0.9867]
+  beta_mkt=1.013  beta_smb=-0.974  beta_hml=0.307  beta_rmw=0.153  beta_cma=-1.621  beta_mom=0.411  (n_obs=79)
+
+=== Agent System Leaderboard ===
+
+        pit_integrity  realistic_execution  market_impact  multi_seed_ci  regime_stratified    sharpe cbs_bps
+system                                                                                                       
+llm              True                 True           True           True               True -0.664453    None
+
+llm: baseline

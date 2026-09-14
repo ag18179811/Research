@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -30,12 +31,17 @@ from execution_replay import (
 # --- Coordination cost ------------------------------------------------------
 # One-way dependency: coordination_cost knows nothing about this module, so there
 # is no cycle. The SDK-to-meter key mapping lives there, next to the price table
-# that consumes it, rather than being restated at each call site.
-from coordination_cost import usage_from_anthropic
+# that consumes it, rather than being restated at each call site. MODEL_PRICES is
+# also the single source of truth for which provider a given model_name routes
+# through (ModelPrice.provider) -- not duplicated here.
+from coordination_cost import MODEL_PRICES, usage_from_anthropic, usage_from_openai_compatible
 
 # --- Claude ---------------------------------------------------------------
 import anthropic
 from dotenv import load_dotenv
+
+# --- Azure AI Foundry (GPT/Grok/DeepSeek, one unified inference route) -----
+import azure_llm
 
 load_dotenv()  # reads a .env file in the current directory into os.environ
 
@@ -125,6 +131,10 @@ class Phase15Bridge:
         adv_window: int = 21,
         synthetic_spread_bps: float = 5.0,
         use_prompt_caching: bool = True,
+        provider: str | None = None,
+        azure_endpoint: str | None = None,
+        azure_api_key: str | None = None,
+        deployment_name: str | None = None,
     ):
         self.store = store
         self.tickers = tickers or dataprep.EVALUATION_TICKERS
@@ -136,11 +146,64 @@ class Phase15Bridge:
         self.max_tokens = max_tokens
         self.adv_window = adv_window
         self.synthetic_spread_bps = synthetic_spread_bps
-        self.use_prompt_caching = use_prompt_caching
-        # api_key=None lets the SDK resolve credentials itself (ANTHROPIC_API_KEY,
-        # ANTHROPIC_AUTH_TOKEN, or an `ant auth login` profile). Passing None is
-        # not the same as having no credentials.
-        self.client = anthropic.Anthropic(api_key=claude_api_key)
+        # Explicit provider wins; otherwise MODEL_PRICES[model_name].provider is
+        # the single source of truth. Falls back to "anthropic" only for a model
+        # not in the table at all, matching this class's original behavior
+        # before Azure support existed.
+        self.provider = provider or MODEL_PRICES.get(model_name, MODEL_PRICES["claude-haiku-4-5"]).provider
+        # Azure's unified inference route has no cache_control breakpoint
+        # mechanism -- caching there (where it happens at all) is automatic
+        # and only ever reported on the read side, never requested. Forcing
+        # this off for that provider keeps _system_blocks/_call_llm honest
+        # about what is actually being asked for, rather than silently no-op
+        # setting cache_control on a request type that cannot use it.
+        # anthropic_foundry shares this on-purpose with anthropic: it's the
+        # same native Messages API wire format (cache_control breakpoints
+        # included), unlike provider="azure"'s OpenAI-compatible route which
+        # has no such mechanism at all.
+        self.use_prompt_caching = use_prompt_caching and self.provider in ("anthropic", "anthropic_foundry")
+
+        if self.provider == "anthropic":
+            # api_key=None lets the SDK resolve credentials itself
+            # (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or an `ant auth login`
+            # profile). Passing None is not the same as having no credentials.
+            self.client = anthropic.Anthropic(api_key=claude_api_key)
+            self.deployment_name = model_name
+        elif self.provider == "azure":
+            if not azure_endpoint or not azure_api_key:
+                raise ValueError(
+                    f"model {model_name!r} routes through provider='azure' but "
+                    f"azure_endpoint/azure_api_key were not given"
+                )
+            self.client = azure_llm.AzureFoundryClient(azure_endpoint, azure_api_key)
+            self.deployment_name = deployment_name or azure_llm.AZURE_DEPLOYMENT_NAMES.get(
+                model_name, model_name)
+        elif self.provider == "anthropic_foundry":
+            # Claude deployed on Azure AI Foundry -- a genuinely different
+            # integration from provider="azure" above, not a variant of it:
+            # this hits Anthropic's own native Messages API
+            # (https://{resource}.services.ai.azure.com/anthropic/v1/*),
+            # billed through the Azure Marketplace in Claude Consumption
+            # Units, NOT the OpenAI-chat-completions-compatible unified
+            # route azure_llm.AzureFoundryClient speaks (that route doesn't
+            # serve Claude at all). Because the wire format is identical to
+            # the direct Anthropic API -- same anthropic Python package,
+            # just anthropic.AnthropicFoundry instead of anthropic.Anthropic
+            # -- _call_llm_anthropic, usage_from_anthropic, and the existing
+            # retry logic in _call_llm all work completely unchanged; only
+            # client construction differs.
+            if not azure_endpoint or not azure_api_key:
+                raise ValueError(
+                    f"model {model_name!r} routes through provider='anthropic_foundry' "
+                    f"but azure_endpoint/azure_api_key were not given"
+                )
+            resource_root = azure_endpoint.split("/api/projects/")[0]
+            self.client = anthropic.AnthropicFoundry(
+                api_key=azure_api_key, base_url=f"{resource_root}/anthropic/")
+            self.deployment_name = deployment_name or model_name
+        else:
+            raise ValueError(f"unknown provider {self.provider!r} for model {model_name!r}")
+
         self._regime_series: pd.Series | None = None  # lazily built, cached
         # Set by _call_llm from response.usage; read by CoordinationMeter via
         # last_usage(). None until the first call, so an unused bridge reports
@@ -285,12 +348,30 @@ class Phase15Bridge:
         coordination_cost.CoordinationMeter.cost_across_models(), which is the only
         thing that will tell you a prefix silently fell below a model's minimum and
         earned no discount at all. Measured once and cached; 0 if the call fails,
-        which reads downstream as "unknown" rather than as a false "yes it cached"."""
+        which reads downstream as "unknown" rather than as a false "yes it cached".
+
+        Azure path: there is no count_tokens endpoint behind the unified
+        inference route, and use_prompt_caching is already forced off for
+        this provider (see __init__), so an exact count would not change any
+        caching decision -- a tiktoken estimate is enough to keep
+        cost_across_models informative without a real API round trip. cl100k
+        is the wrong tokenizer for Grok/DeepSeek specifically, but it is a
+        same-order-of-magnitude stand-in, and is clearly not the value read
+        for the Anthropic path above."""
         if self._prefix_tokens:
+            return self._prefix_tokens
+        if self.provider == "azure":
+            try:
+                import tiktoken
+                enc = tiktoken.get_encoding("cl100k_base")
+                self._prefix_tokens = len(enc.encode(SYSTEM_PROMPT))
+            except Exception as exc:
+                log.warning("tiktoken estimate failed (%s); prefix size unknown", exc)
+                self._prefix_tokens = 0
             return self._prefix_tokens
         try:
             counted = self.client.messages.count_tokens(
-                model=self.model_name,
+                model=self.deployment_name,
                 system=self._system_blocks(),
                 messages=[{"role": "user", "content": "x"}],
             )
@@ -308,8 +389,63 @@ class Phase15Bridge:
         it. None before the first call."""
         return self._last_usage
 
-    # -- call Claude -------------------------------------------------------
-    def _call_llm(self, prompt: str) -> dict:
+    # -- call the LLM --------------------------------------------------------
+    def _call_llm(self, prompt: str, max_retries: int = 3) -> dict:
+        """Retries on transient failure. Confirmed live, both providers:
+
+        1. Empty/unparseable response (json.JSONDecodeError) -- Kimi-K2.6
+           returned an empty content field when its reasoning consumed the
+           whole token budget (fixed separately with a higher max_tokens),
+           and claude-opus-5 returned a genuine HTTP 200 with empty text on
+           2010-05-21 -- something Claude Haiku never did across 378+
+           decisions in its own earlier full crisis run.
+        2. Network/connection failure (anthropic.APIConnectionError) --
+           confirmed live: the SAME claude-opus-5 crisis run separately hit
+           36 real `httpx.ConnectError: nodename nor servname provided`
+           failures (a genuine local DNS/network hiccup, not a code bug) in
+           one run, none of which were retried before this fix, because the
+           except clause only covered JSONDecodeError -- an unrelated
+           exception type from an unrelated cause. Fixing #1 alone was not
+           sufficient; #2 turned out to be the far larger contributor to
+           that run's actual failure count (36 vs 1).
+        3. Rate limit / server error (anthropic.APIStatusError with
+           status_code 429 or >=500) -- NOT other 4xx: a genuine bad
+           request or auth failure would fail identically on every retry,
+           same reasoning as azure_llm.py's TransientAzureError split.
+
+        The Anthropic SDK path had no retry wrapper of its own the way
+        azure_llm.py's AzureFoundryClient does, so any of the above
+        previously failed the day outright with no second attempt.
+
+        NOTE the same caveat that already applies to the Azure retry path:
+        a failed attempt's token usage is not separately accounted for --
+        only the eventually-successful attempt's usage lands in
+        last_usage(). coordination_cost.py already documents failed-decision
+        cost as a lower bound for exactly this reason; this doesn't change
+        that, just extends it to Anthropic-side retries too."""
+        delay = 5.0
+        for attempt in range(max_retries + 1):
+            exc: Exception
+            try:
+                if self.provider == "azure":
+                    return self._call_llm_azure(prompt)
+                return self._call_llm_anthropic(prompt)
+            except anthropic.APIStatusError as e:
+                if not (e.status_code == 429 or e.status_code >= 500):
+                    raise   # genuine 4xx -- not transient, would fail identically every time
+                exc = e
+            except (json.JSONDecodeError, anthropic.APIConnectionError) as e:
+                exc = e
+
+            if attempt == max_retries:
+                raise exc
+            log.warning("%s call failed (%s), retry %d/%d in %.0fs",
+                       self.model_name, exc, attempt + 1, max_retries, delay)
+            time.sleep(delay)
+            delay = min(delay * 3, 120.0)
+        raise AssertionError("unreachable")
+
+    def _call_llm_anthropic(self, prompt: str) -> dict:
         response = self.client.messages.create(
             model=self.model_name,
             max_tokens=self.max_tokens,
@@ -321,14 +457,30 @@ class Phase15Bridge:
         # committee ends up looking cheaper than it was.
         self._last_usage = usage_from_anthropic(response)
         text = "".join(block.text for block in response.content if block.type == "text").strip()
+        return self._parse_decision_json(text)
+
+    def _call_llm_azure(self, prompt: str) -> dict:
+        response = self.client.chat_completions_create(
+            deployment=self.deployment_name,
+            max_tokens=self.max_tokens,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        self._last_usage = usage_from_openai_compatible(response)
+        text = response["choices"][0]["message"]["content"].strip()
+        return self._parse_decision_json(text)
+
+    def _parse_decision_json(self, text: str) -> dict:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             # Belt-and-suspenders: strip stray code fences and retry once
-            # before giving up. More important here than it was with Gemini,
-            # since Claude has no request-level JSON-mode enforcement -- the
-            # system prompt above is the only thing steering it, and it can
-            # still occasionally wrap output in ```json fences anyway.
+            # before giving up. No provider here enforces request-level JSON
+            # mode through this call shape -- the system prompt is the only
+            # thing steering output format, and any of them can still
+            # occasionally wrap a response in ```json fences anyway.
             cleaned = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE).strip()
             return json.loads(cleaned)
 
@@ -357,7 +509,19 @@ class Phase15Bridge:
             decision["action"] = "HOLD"
             return decision
 
-        last_price = float(snap["tickers"][symbol]["prices"].sort_values("date")["adj_close"].iloc[-1])
+        price_rows = snap["tickers"][symbol]["prices"]
+        if price_rows.empty:
+            # Same real state _format_prompt already guards against (its
+            # `price_rows.empty` check a few lines up) -- a gap day,
+            # pre-listing date, or a pull gap in the data. symbol passed the
+            # tradeable-universe check above, which only verifies it's in
+            # self.tickers, not that today has a price row for it. Without
+            # this guard, .iloc[-1] on the empty frame raises IndexError,
+            # uncaught here -- confirmed live-reachable, not hypothetical.
+            log.warning("no price data for %s today, treating as HOLD", symbol)
+            decision["action"] = "HOLD"
+            return decision
+        last_price = float(price_rows.sort_values("date")["adj_close"].iloc[-1])
 
         if action == "SELL":
             held = portfolio.positions.get(symbol, 0.0)

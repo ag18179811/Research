@@ -1,0 +1,72 @@
+
+=== Joint Metric Report: kimi-k2.6-final ===
+
+-- Temporal Integrity: PASS --
+  [informational] 48750327 rows filtered out as future-dated / 502240893 returned across 89732 loader queries -- this is the PiT filter operating normally, not a leak
+
+-- Regime Robustness --
+        regime  n_episodes  mean_net_return  mean_sharpe  std_sharpe  mean_sortino  mean_max_drawdown  mean_breakeven_bps
+        crisis           6     12928.760925     1.551374    1.143202      2.424797           0.084918                 0.0
+mean_reverting           6      3967.644011     0.710368    2.258337      1.463247           0.067442                 0.0
+      trending           6      9990.275838     2.057824    2.304701      3.596390           0.086067                 0.0
+
+-- Executable Performance (aggregate across episodes) --
+mean Sharpe:  1.407  95% CI [0.566, 2.309]
+mean Sortino: 2.161  95% CI [0.822, 3.785]
+
+-- Attribution --
+alpha (annualized): 0.1986  95% CI [0.0095, 0.4108]
+  beta_mkt=0.643  beta_smb=-0.066  beta_hml=-0.274  beta_rmw=0.032  beta_cma=0.219  beta_mom=0.203  (n_obs=1108)
+
+-- Attribution ablation (same data, different factor-set sizes) --
+  is alpha robust to specification choice, or an artifact of picking one?
+              spec  n_factors  alpha_annualized  alpha_ci_low  alpha_ci_high  n_obs  beta_mkt  beta_smb  beta_hml  beta_rmw  beta_cma  beta_mom
+      capm_1factor          1            0.2506        0.0818         0.4658   1108    0.5844       NaN       NaN       NaN       NaN       NaN
+        ff_3factor          3            0.2252        0.0446         0.4375   1108    0.6296   -0.1502   -0.2786       NaN       NaN       NaN
+ff_carhart_6factor          6            0.1986        0.0095         0.4108   1108    0.6435   -0.0660   -0.2744    0.0318    0.2185    0.2033
+
+=== Agent System Leaderboard ===
+
+                 pit_integrity  realistic_execution  market_impact  multi_seed_ci  regime_stratified   sharpe cbs_bps
+system                                                                                                               
+kimi-k2.6-final           True                 True           True           True               True  1.40737    None
+
+kimi-k2.6-final: baseline
+
+========================================================================
+COORDINATION COST
+========================================================================
+
+=== Coordination cost: kimi-k2.6-final ===
+  model                : Kimi K2.6 (Azure)  ($0.95/$4.0 per MTok, Azure AI Foundry pricing meter; matches Moonshot's own direct-API rate exactly (unlike DeepSeek's ~4x Azure markup above) -- no premium found for the Azure-hosted version of this one., verified 2026-08-27)
+  cache rates          : read $0.10 / write $1.19 per MTok (min cacheable prefix 1,024 tok)
+  billing              : caching on, batch off, TTL 5m
+  token counts         : PARTIAL -- 1,125/1,126 decisions measured, the rest assumed; do not publish
+  decisions            : 1,126  (1 failed)
+  LLM calls            : 1,125 (1.0 per decision)
+  input tokens         : 3,387,350 uncached / 0 cache-read / 0 cache-write
+  output tokens        : 3,096,779
+  inter-agent messages : 0
+  token cost (list)    : $15.61
+  token cost (billed)  : $15.61
+  NOTE                 : 1 failed decision(s) are charged latency but $0.00 in tokens -- the request was sent and billed, but no usage came back to measure. Treat the token line as a lower bound.
+  mean decision latency: 14.59 s
+  signal decay at that latency: 100.0% of edge retained
+
+  same token volume, priced across the ladder (cost is a model-selection decision, not a constant):
+                                     model usd_per_mtok  cost_usd prefix_caches                                                                                                                                                                                                                                                                                                                                                     source
+                         Kimi K2.6 (Azure)     $0.95/$4     15.61 NO (233<1024)                                                                                                                                                                    Azure AI Foundry pricing meter; matches Moonshot's own direct-API rate exactly (unlike DeepSeek's ~4x Azure markup above) -- no premium found for the Azure-hosted version of this one.
+                   DeepSeek V4 Pro (Azure)  $1.74/$3.48     16.67 NO (233<1024)                                                                                                      Azure AI Foundry pricing meter (Future AGI cost calculator); ~4x DeepSeek's own direct-API rate ($0.435/$0.87) -- Azure-hosted DeepSeek is billed on Azure's own meter, not passed through at cost, per a Microsoft Q&A thread flagging the same gap.
+                          Claude Haiku 4.5        $1/$5     18.87 NO (233<4096)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+         Grok 4.6 (Azure, name UNVERIFIED)        $2/$6     25.36 NO (233<1024) PROVISIONAL -- xAI direct-API rate, used as a stand-in. Azure's own Grok catalog was only confirmed up to Grok 4.3 Global ($1.25/$2.50) as of this search; the deployment named 'grok-4.6' in the portal is not proof the underlying weights are 4.6. Confirm the base model on the deployment's own 'Models + endpoints' card before publishing this row.
+    Claude Sonnet 5 (intro, to 2026-08-31)       $2/$10     37.74 NO (233<1024)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+                         Claude Sonnet 4.6       $3/$15     56.61 NO (233<1024)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+                           Claude Sonnet 5       $3/$15     56.61 NO (233<1024)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+                           Claude Opus 4.6       $5/$25     94.36 NO (233<1024)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+                           Claude Opus 4.7       $5/$25     94.36 NO (233<1024)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+                           Claude Opus 4.8       $5/$25     94.36 NO (233<1024)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+                             Claude Opus 5       $5/$25     94.36  NO (233<512)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+         Claude Opus 5 (Microsoft Foundry)       $5/$25     94.36  NO (233<512)    Anthropic's own Claude-in-Microsoft-Foundry pricing docs: 'Foundry adds no markup -- you pay standard Anthropic rates, converted to CCUs for Azure billing.' Billed via Azure Marketplace (Claude Consumption Units, $0.01/CCU, postpaid/arrears), not the Anthropic account credit balance that blocked claude-opus-5 runs twice earlier this session.
+                       GPT-5.6 Sol (Azure)       $5/$30    109.84 NO (233<1024)                                                                                                                                                                                                                                                            Azure OpenAI published rate (~10% regional uplift over base first-party rate; see azure_llm.py)
+                            Claude Fable 5      $10/$50    188.71  NO (233<512)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+    NB: repricing swaps the RATE, not the tokenization. Models in a different tokenizer family would emit different counts for the same text; re-measure rather than trusting the swap.

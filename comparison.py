@@ -91,9 +91,27 @@ def coordination_breakeven_spread(
     Both episode sets must have been run over the *same* episode windows
     (same dates, same regime labels) -- this is what makes the comparison
     valid rather than an artifact of different market conditions, per the
-    proposal's Motivation section. This function doesn't verify that for
-    you; pass in episodes generated from a single shared
-    run_all_episodes(..., start=..., end=...) call reused across systems."""
+    proposal's Motivation section. Enforced below, not just documented: in
+    the real pipeline each system is backtested by a SEPARATE CLI invocation
+    (main.py backtest --agent llm --model X --system X ...), independently
+    writing runs/<system>.json -- nothing stops one system from later being
+    rerun by hand with a shifted --start/--end (e.g. after a rate-limit
+    failure) and main.py report would otherwise combine it with the others
+    with no warning, silently comparing "system's PnL over a shorter window"
+    against "baseline's PnL over the original window" as if it meant
+    something."""
+    sys_key = sorted((str(ep.episode_start), str(ep.episode_end), ep.regime) for ep in system_episodes)
+    base_key = sorted((str(ep.episode_start), str(ep.episode_end), ep.regime) for ep in baseline_episodes)
+    if sys_key != base_key:
+        raise ValueError(
+            f"CBS({system_name!r} vs {baseline_name!r}): episode sets don't match -- "
+            f"{system_name} has {len(system_episodes)} episode(s), {baseline_name} has "
+            f"{len(baseline_episodes)}. CBS compares aggregate PnL across systems and is "
+            f"only meaningful when both ran the exact same (start, end, regime) windows; "
+            f"re-run whichever system is missing/extra episodes over the shared range "
+            f"before comparing."
+        )
+
     advantage_0 = _system_adjusted_pnl(system_episodes, 0.0) - _system_adjusted_pnl(baseline_episodes, 0.0)
     if advantage_0 <= 0:
         return CBSResult(system_name, baseline_name, advantage_0, 0.0, max_bps)

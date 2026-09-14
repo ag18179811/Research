@@ -1,0 +1,71 @@
+
+=== Joint Metric Report: deepseek-v4-pro-final ===
+
+-- Temporal Integrity: PASS --
+  [informational] 48750327 rows filtered out as future-dated / 502240893 returned across 89732 loader queries -- this is the PiT filter operating normally, not a leak
+
+-- Regime Robustness --
+        regime  n_episodes  mean_net_return  mean_sharpe  std_sharpe  mean_sortino  mean_max_drawdown  mean_breakeven_bps
+        crisis           6       911.756867     0.043646    1.965072      0.407533           0.013311                 0.0
+mean_reverting           6     -2593.071449    -1.806896    4.039755     -1.276188           0.059488                 0.0
+      trending           6     -5824.191520    -0.157878    3.257435      1.341574           0.118355                 0.0
+
+-- Executable Performance (aggregate across episodes) --
+mean Sharpe:  -0.819  95% CI [-1.697, 0.272]
+mean Sortino: -0.993  95% CI [-1.877, 0.415]
+
+-- Attribution --
+alpha (annualized): -0.1371  95% CI [-0.3236, 0.0100]
+  beta_mkt=0.099  beta_smb=0.026  beta_hml=0.025  beta_rmw=-0.012  beta_cma=-0.068  beta_mom=0.049  (n_obs=1108)
+
+-- Attribution ablation (same data, different factor-set sizes) --
+  is alpha robust to specification choice, or an artifact of picking one?
+              spec  n_factors  alpha_annualized  alpha_ci_low  alpha_ci_high  n_obs  beta_mkt  beta_smb  beta_hml  beta_rmw  beta_cma  beta_mom
+      capm_1factor          1           -0.1371       -0.3183         0.0123   1108    0.1056       NaN       NaN       NaN       NaN       NaN
+        ff_3factor          3           -0.1374       -0.3187         0.0141   1108    0.1041    0.0215   -0.0160       NaN       NaN       NaN
+ff_carhart_6factor          6           -0.1371       -0.3236         0.0100   1108    0.0987    0.0259    0.0252   -0.0118   -0.0677    0.0487
+
+=== Agent System Leaderboard ===
+
+                       pit_integrity  realistic_execution  market_impact  multi_seed_ci  regime_stratified    sharpe cbs_bps
+system                                                                                                                      
+deepseek-v4-pro-final           True                 True           True           True               True -0.819093    None
+
+deepseek-v4-pro-final: baseline
+
+========================================================================
+COORDINATION COST
+========================================================================
+
+=== Coordination cost: deepseek-v4-pro-final ===
+  model                : DeepSeek V4 Pro (Azure)  ($1.74/$3.48 per MTok, Azure AI Foundry pricing meter (Future AGI cost calculator); ~4x DeepSeek's own direct-API rate ($0.435/$0.87) -- Azure-hosted DeepSeek is billed on Azure's own meter, not passed through at cost, per a Microsoft Q&A thread flagging the same gap., verified 2026-08-06)
+  cache rates          : read $0.17 / write $2.17 per MTok (min cacheable prefix 1,024 tok)
+  billing              : caching on, batch off, TTL 5m
+  token counts         : MEASURED from the agent
+  decisions            : 1,126
+  LLM calls            : 1,126 (1.0 per decision)
+  input tokens         : 3,700,981 uncached / 0 cache-read / 0 cache-write
+  output tokens        : 136,723
+  inter-agent messages : 0
+  token cost (list)    : $6.92
+  token cost (billed)  : $6.92
+  mean decision latency: 8.22 s
+  signal decay at that latency: 100.0% of edge retained
+
+  same token volume, priced across the ladder (cost is a model-selection decision, not a constant):
+                                     model usd_per_mtok  cost_usd prefix_caches                                                                                                                                                                                                                                                                                                                                                     source
+                         Kimi K2.6 (Azure)     $0.95/$4      4.06 NO (233<1024)                                                                                                                                                                    Azure AI Foundry pricing meter; matches Moonshot's own direct-API rate exactly (unlike DeepSeek's ~4x Azure markup above) -- no premium found for the Azure-hosted version of this one.
+                          Claude Haiku 4.5        $1/$5      4.38 NO (233<4096)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+                   DeepSeek V4 Pro (Azure)  $1.74/$3.48      6.92 NO (233<1024)                                                                                                      Azure AI Foundry pricing meter (Future AGI cost calculator); ~4x DeepSeek's own direct-API rate ($0.435/$0.87) -- Azure-hosted DeepSeek is billed on Azure's own meter, not passed through at cost, per a Microsoft Q&A thread flagging the same gap.
+         Grok 4.6 (Azure, name UNVERIFIED)        $2/$6      8.22 NO (233<1024) PROVISIONAL -- xAI direct-API rate, used as a stand-in. Azure's own Grok catalog was only confirmed up to Grok 4.3 Global ($1.25/$2.50) as of this search; the deployment named 'grok-4.6' in the portal is not proof the underlying weights are 4.6. Confirm the base model on the deployment's own 'Models + endpoints' card before publishing this row.
+    Claude Sonnet 5 (intro, to 2026-08-31)       $2/$10      8.77 NO (233<1024)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+                         Claude Sonnet 4.6       $3/$15     13.15 NO (233<1024)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+                           Claude Sonnet 5       $3/$15     13.15 NO (233<1024)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+                           Claude Opus 4.6       $5/$25     21.92 NO (233<1024)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+                           Claude Opus 4.7       $5/$25     21.92 NO (233<1024)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+                           Claude Opus 4.8       $5/$25     21.92 NO (233<1024)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+                             Claude Opus 5       $5/$25     21.92  NO (233<512)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+         Claude Opus 5 (Microsoft Foundry)       $5/$25     21.92  NO (233<512)    Anthropic's own Claude-in-Microsoft-Foundry pricing docs: 'Foundry adds no markup -- you pay standard Anthropic rates, converted to CCUs for Azure billing.' Billed via Azure Marketplace (Claude Consumption Units, $0.01/CCU, postpaid/arrears), not the Anthropic account credit balance that blocked claude-opus-5 runs twice earlier this session.
+                       GPT-5.6 Sol (Azure)       $5/$30     22.61 NO (233<1024)                                                                                                                                                                                                                                                            Azure OpenAI published rate (~10% regional uplift over base first-party rate; see azure_llm.py)
+                            Claude Fable 5      $10/$50     43.85  NO (233<512)                                                                                                                                                                                                                                                                                                                           anthropic docs (first-party API)
+    NB: repricing swaps the RATE, not the tokenization. Models in a different tokenizer family would emit different counts for the same text; re-measure rather than trusting the swap.

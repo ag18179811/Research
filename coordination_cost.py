@@ -116,6 +116,13 @@ class ModelPrice:
     cache_min_tokens: int = 1024      # prefixes below this silently do not cache
     cache_read_mult: float = 0.10     # cache hit  ~= 0.1x base input
     cache_write_mult: float = 1.25    # cache write = 1.25x base (5m TTL); 2.0 at 1h
+    # Which client Phase15Bridge builds for this key. "anthropic" uses
+    # explicit cache_control breakpoints (see _system_blocks); "azure" goes
+    # through azure_llm.AzureFoundryClient's unified inference route and
+    # never earns cache-write credit -- reads are still reported (see
+    # usage_from_openai_compatible), writes are not billed or reported
+    # separately by that API at all, so cache_write_mult is moot for it.
+    provider: str = "anthropic"
 
     @property
     def cached_input_per_mtok(self) -> float:
@@ -157,6 +164,59 @@ MODEL_PRICES: dict[str, ModelPrice] = {
     "claude-opus-4-8":   ModelPrice("Claude Opus 4.8",   5.0, 25.0, _A, "2026-08-14", cache_min_tokens=1024),
     "claude-opus-5":     ModelPrice("Claude Opus 5",     5.0, 25.0, _A, "2026-08-14", cache_min_tokens=512),
     "claude-fable-5":    ModelPrice("Claude Fable 5",   10.0, 50.0, _A, "2026-08-14", cache_min_tokens=512),
+
+    # --- Azure AI Foundry -- all via azure_llm.AzureFoundryClient ----------
+    "gpt-5.6-sol": ModelPrice(
+        "GPT-5.6 Sol (Azure)", 5.0, 30.0,
+        "Azure OpenAI published rate (~10% regional uplift over base "
+        "first-party rate; see azure_llm.py)", "2026-08-21",
+        cache_min_tokens=1024, provider="azure"),
+    "grok-4.6": ModelPrice(
+        "Grok 4.6 (Azure, name UNVERIFIED)", 2.0, 6.0,
+        "PROVISIONAL -- xAI direct-API rate, used as a stand-in. Azure's own "
+        "Grok catalog was only confirmed up to Grok 4.3 Global ($1.25/$2.50) "
+        "as of this search; the deployment named 'grok-4.6' in the portal is "
+        "not proof the underlying weights are 4.6. Confirm the base model on "
+        "the deployment's own 'Models + endpoints' card before publishing "
+        "this row.", "2026-08-26",
+        cache_min_tokens=1024, provider="azure"),
+    "deepseek-v4-pro": ModelPrice(
+        "DeepSeek V4 Pro (Azure)", 1.74, 3.48,
+        "Azure AI Foundry pricing meter (Future AGI cost calculator); ~4x "
+        "DeepSeek's own direct-API rate ($0.435/$0.87) -- Azure-hosted "
+        "DeepSeek is billed on Azure's own meter, not passed through at cost, "
+        "per a Microsoft Q&A thread flagging the same gap.", "2026-08-06",
+        cache_min_tokens=1024, provider="azure"),
+    "kimi-k2.6": ModelPrice(
+        "Kimi K2.6 (Azure)", 0.95, 4.00,
+        "Azure AI Foundry pricing meter; matches Moonshot's own direct-API "
+        "rate exactly (unlike DeepSeek's ~4x Azure markup above) -- no "
+        "premium found for the Azure-hosted version of this one.",
+        "2026-08-27", cache_min_tokens=1024, provider="azure"),
+
+    # --- Claude via Microsoft Foundry -- native Anthropic Messages API, ----
+    # --- NOT the azure_llm.AzureFoundryClient route above (see            ---
+    # --- phase1_5_agent.Phase15Bridge's provider="anthropic_foundry"      ---
+    # --- branch). Billed through the Azure Marketplace in Claude          ---
+    # --- Consumption Units, not a direct token meter -- but Anthropic's   ---
+    # --- own docs are explicit that Foundry adds no markup: "you pay      ---
+    # --- standard Anthropic rates, converted to CCUs for Azure billing."  ---
+    # --- Same $5/$25 as the direct-API claude-opus-5 row above; a         ---
+    # --- separate price-table key anyway (not reusing "claude-opus-5")    ---
+    # --- because provider selection is per-key, and this specific         ---
+    # --- deployment is billed against Azure Marketplace/CCUs (postpaid,   ---
+    # --- no prepaid balance) rather than an Anthropic-account credit      ---
+    # --- balance -- a materially different real-world payment path even   ---
+    # --- though the USD rate is identical.
+    "claude-opus-5-azure": ModelPrice(
+        "Claude Opus 5 (Microsoft Foundry)", 5.0, 25.0,
+        "Anthropic's own Claude-in-Microsoft-Foundry pricing docs: 'Foundry "
+        "adds no markup -- you pay standard Anthropic rates, converted to "
+        "CCUs for Azure billing.' Billed via Azure Marketplace (Claude "
+        "Consumption Units, $0.01/CCU, postpaid/arrears), not the Anthropic "
+        "account credit balance that blocked claude-opus-5 runs twice "
+        "earlier this session.", "2026-08-27",
+        cache_min_tokens=512, provider="anthropic_foundry"),
 }
 
 # Two caveats on the table above, both of which move a reported number:
@@ -307,6 +367,41 @@ def usage_from_anthropic(response, llm_calls: int = 1) -> dict:
     }
 
 
+def usage_from_openai_compatible(response: dict, llm_calls: int = 1) -> dict:
+    """Convert an OpenAI-chat-completions-shaped response (Azure AI Foundry's
+    unified inference route, for GPT/Grok/DeepSeek deployments alike) into the
+    same DecisionRecord keys usage_from_anthropic produces.
+
+    DELIBERATELY reports zero cached/cache-write tokens even though the API
+    sometimes does (confirmed live: a GPT-5.6-Sol response's
+    prompt_tokens_details carried both `cached_tokens` and
+    `cache_write_tokens`, Grok/DeepSeek responses carried neither). The two
+    cache multipliers on ModelPrice (cache_read_mult=0.10, cache_write_mult=
+    1.25) were calibrated against Anthropic's own published rates -- there is
+    no verified, sourced discount rate for what a cache hit/write actually
+    costs on Azure's OpenAI/Grok/DeepSeek meters. Crediting Anthropic's 0.10x
+    read discount here would UNDERSTATE these providers' true cost with a
+    made-up number, which is a worse failure than reporting the conservative
+    (fully-billed) figure -- so every token this function returns is counted
+    as plain uncached input_tokens, full price, until someone sources a real
+    per-provider cache rate and this gets a provider-specific multiplier of
+    its own rather than borrowing Anthropic's."""
+    usage = response.get("usage") or {}
+    prompt = int(usage.get("prompt_tokens", 0) or 0)
+    completion = int(usage.get("completion_tokens", 0) or 0)
+
+    if not (prompt or completion):
+        return {}
+
+    return {
+        "llm_calls": llm_calls,
+        "input_tokens": prompt,
+        "cached_input_tokens": 0,
+        "cache_write_tokens": 0,
+        "output_tokens": completion,
+    }
+
+
 @dataclass(frozen=True)
 class CostEstimate:
     """What a run is projected to cost, before it is allowed to start."""
@@ -351,14 +446,24 @@ def estimate_cost(cfg: "CoordinationCostConfig", n_decisions: int,
     -- that is the loosest term in the estimate and the reason to treat the result
     as a budget guard, not a forecast.
 
-    Caching is credited ONLY when the measured prefix clears the model's minimum.
-    Below it the API returns no error and no discount, so crediting one here would
-    reproduce exactly the flattering assumption this module exists to prevent.
+    Caching is credited ONLY when the measured prefix clears the model's minimum
+    AND the provider is one this module has a verified cache-discount rate for
+    (Anthropic). Below the minimum the API returns no error and no discount, so
+    crediting one here would reproduce exactly the flattering assumption this
+    module exists to prevent -- and usage_from_openai_compatible (the Azure
+    usage parser) deliberately reports zero cached/cache-write tokens for the
+    same reason: no sourced discount rate exists for Azure's OpenAI/Grok/
+    DeepSeek meters. Without the provider check, this projection would credit
+    an Azure model a discount its own post-hoc accounting (via
+    CoordinationMeter, once real usage comes back) would never actually apply
+    -- the preflight --max-spend budget guard silently under-quoting the real
+    bill the moment an Azure run's prefix happens to clear cache_min_tokens.
     """
     p = cfg.effective_price()
     out_per_call = (cfg.assumed_tokens_per_llm_call_out
                     if output_tokens_per_call is None else output_tokens_per_call)
-    caches = bool(cfg.use_prompt_caching and prefix_tokens >= p.cache_min_tokens)
+    caches = bool(cfg.use_prompt_caching and p.provider == "anthropic"
+                  and prefix_tokens >= p.cache_min_tokens)
 
     if caches:
         # First call writes the prefix; the rest read it. Everything beyond the

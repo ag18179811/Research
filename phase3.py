@@ -43,6 +43,11 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import queue
+import random
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Protocol, Sequence
@@ -50,6 +55,7 @@ from typing import Callable, Iterable, Protocol, Sequence
 import numpy as np
 import pandas as pd
 
+from azure_llm import _PROPAGATE_HARD_TIMEOUT_SECONDS, _request_with_hard_timeout
 from dataprep import (
     PointInTimeStore,
     generate_episode_windows,
@@ -148,6 +154,99 @@ class AgentFn(Protocol):
         cash: float,
         as_of: pd.Timestamp,
     ) -> list[Order]: ...
+
+
+class CadenceGatedAgent:
+    """Wraps any AgentFn so it only actually decides every N trading days
+    within an episode (N chosen per regime), holding on the days in
+    between -- run_episode itself calls agent_fn unconditionally every
+    trading day (see its loop above), so gating has to happen here, one
+    layer up.
+
+    Not TradingAgents-specific: used identically to reduce a single-agent
+    baseline's decision frequency to match TradingAgents' reduced cadence
+    for a valid, matched-cadence comparison (see run_tradingagents_episodes.py).
+
+    The caller must call set_regime(regime) before each run_episode() call
+    -- run_episode doesn't pass regime into agent_fn, so the orchestrator,
+    which already knows the regime for the episode it's about to run, sets
+    it explicitly rather than this class trying to infer it.
+
+    Correctness note, found while designing this (not while debugging a
+    live run): on a hold day, last_usage()/true_blended_cost_usd() must
+    NOT just forward to the wrapped agent's own last_usage() -- that would
+    return whatever the wrapped agent last reported for its most recent
+    REAL decision, and CoordinationMeter would then double-count that same
+    cost again on every hold day in between, since it calls
+    agent.last_usage() unconditionally after every agent_fn(...) call. This
+    class tracks whether its own most recent __call__ was a real decision
+    or a hold and returns explicit zero usage on hold days."""
+
+    def __init__(self, agent, regime_intervals: dict[str, int]):
+        self.agent = agent
+        self.regime_intervals = regime_intervals
+        # Deliberately NOT getattr(agent, "n_agents", 1) -- confirmed live:
+        # CoordinationMeter._record() has `if not calls and self.n_agents > 1:
+        # calls = self.n_agents`, a fallback meant for "the agent didn't
+        # expose real measurement, assume one call per seat." On a hold day
+        # this class's last_usage() correctly reports {} (zero calls is the
+        # TRUE, measured value, not a measurement failure), but
+        # CoordinationMeter can't tell the difference between "empty because
+        # unmeasured" and "empty because genuinely zero" -- it only checks
+        # `not calls`. With n_agents inherited from the wrapped multi-agent
+        # system (e.g. 2-6), every one of the many hold days in a reduced-
+        # cadence run was silently getting an ASSUMED, non-zero cost
+        # (n_agents calls at the generic assumed-tokens-per-call rate)
+        # instead of the real zero -- caught in a real smoke test (62-day
+        # episode, 55 hold days, reported cost inflated by exactly this).
+        # n_agents=1 makes the fallback's `self.n_agents > 1` always False,
+        # so a real zero is never overwritten; real decision days are
+        # unaffected since they already report genuine non-empty usage.
+        self.n_agents = 1
+        self._day_index = 0
+        self._regime: str | None = None
+        self._last_call_was_real = False
+
+    def set_regime(self, regime: str) -> None:
+        """Call once at the start of each episode. Also resets the wrapped
+        agent's own state (e.g. _LLMAgent.reset() clears trade history so
+        it can't leak into the next episode's prompts) -- a new episode
+        always means both a (possibly different) regime AND a fresh agent
+        in this pipeline's own convention (run_episode's docstring: "the
+        agent resets at every episode start"), so this does both in one
+        call rather than making every caller remember two separate calls."""
+        self._regime = regime
+        self._day_index = 0
+        if hasattr(self.agent, "reset"):
+            self.agent.reset()
+
+    def reset(self) -> None:
+        if hasattr(self.agent, "reset"):
+            self.agent.reset()
+        self._day_index = 0
+
+    def __call__(self, decision_snapshots, positions, cash, as_of):
+        interval = self.regime_intervals.get(self._regime, 1)
+        is_decision_day = (self._day_index % interval) == 0
+        self._day_index += 1
+        self._last_call_was_real = is_decision_day
+        if not is_decision_day:
+            return []
+        return self.agent(decision_snapshots, positions, cash, as_of)
+
+    def last_usage(self) -> dict:
+        if not self._last_call_was_real:
+            return {}
+        if hasattr(self.agent, "last_usage"):
+            return self.agent.last_usage()
+        return {}
+
+    def true_blended_cost_usd(self) -> float:
+        if not self._last_call_was_real:
+            return 0.0
+        if hasattr(self.agent, "true_blended_cost_usd"):
+            return self.agent.true_blended_cost_usd()
+        return 0.0
 
 
 def run_episode(
@@ -427,6 +526,94 @@ def register_pit_fundamentals_vendor() -> None:
     ta_interface.VENDOR_METHODS["get_fundamentals"]["benchmark_pit"] = pit_safe_get_fundamentals
 
 
+def register_wide_ohlcv_window() -> None:
+    """Call once, before constructing any TradingAgentsGraph. Patches
+    tradingagents.dataflows.stockstats_utils.load_ohlcv, whose price-history
+    fetch/cache window is hardcoded to "5 years before wall-clock today"
+    (today_date = pd.Timestamp.today(); start_date = today_date -
+    DateOffset(years=5)) -- NOT relative to curr_date, the date actually
+    being backtested. Confirmed live in a pre-run smoke test: every episode
+    window starting more than ~5 years before the real calendar date this
+    was run (15 of this benchmark's 18 balanced-regime episodes -- anything
+    before ~2021) made get_verified_market_snapshot raise "No OHLCV data
+    available" on every single call, silently caught by
+    TradingAgentsAdapter's own exception handler as a Hold. Not a crash,
+    but real money would have been spent on decisions with no real market
+    data behind them for 83% of episodes -- caught before the paid run, not
+    after.
+
+    Fix: widen the raw fetch window to a fixed 2005-01-01..today range
+    (Yahoo Finance returns this much history in one request without
+    trouble) rather than trying to compute a per-curr_date window. This is
+    safe: the existing look-ahead filter inside load_ohlcv
+    (`data[data["Date"] <= curr_date_dt]`) is untouched and is the actual
+    point-in-time enforcement here -- widening the raw fetch does not
+    change what any call is allowed to see, only what's available to
+    filter from. The rest of the original's logic (on-disk caching,
+    yf_retry, the same-day-refresh check, the stale-frame assertion) is
+    reused as-is via the module's own helpers, not reimplemented, so this
+    changes only the window.
+
+    load_ohlcv is imported by name (`from ... import load_ohlcv`) in three
+    separate modules -- stockstats_utils itself, market_data_validator.py,
+    and y_finance.py (confirmed by grepping the installed package) -- so
+    the replacement has to be assigned in each of their namespaces
+    individually; patching only the origin module leaves the other two
+    still bound to the original function object."""
+    from tradingagents.dataflows import market_data_validator as mdv
+    from tradingagents.dataflows import stockstats_utils as ssu
+    from tradingagents.dataflows import y_finance as yf_mod
+
+    fixed_start = pd.Timestamp("2005-01-01")
+
+    def _wide_load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
+        canonical = ssu.normalize_symbol(symbol)
+        safe_symbol = ssu.safe_ticker_component(canonical)
+
+        config = ssu.get_config()
+        curr_date_dt = pd.to_datetime(curr_date)
+
+        today_date = pd.Timestamp.today()
+        start_str = fixed_start.strftime("%Y-%m-%d")
+        end_str = (today_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+        os.makedirs(config["data_cache_dir"], exist_ok=True)
+        data_file = os.path.join(
+            config["data_cache_dir"],
+            f"{safe_symbol}-YFin-data-{start_str}-{end_str}.csv",
+        )
+
+        data = None
+        if os.path.exists(data_file):
+            cached = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
+            if (
+                not cached.empty
+                and "Close" in cached.columns
+                and not ssu._needs_same_day_refresh(data_file, curr_date_dt, today_date)
+            ):
+                data = cached
+
+        if data is None:
+            downloaded = ssu.yf_retry(lambda: ssu.yf.download(
+                canonical, start=start_str, end=end_str,
+                multi_level_index=False, progress=False, auto_adjust=True,
+            ))
+            downloaded = ssu._ensure_date_column(downloaded.reset_index())
+            if downloaded.empty or "Close" not in downloaded.columns:
+                raise ssu.NoMarketDataError(symbol, canonical, "Yahoo Finance returned no rows")
+            downloaded.to_csv(data_file, index=False, encoding="utf-8")
+            data = downloaded
+
+        data = ssu._clean_dataframe(data)
+        data = data[data["Date"] <= curr_date_dt]
+        ssu._assert_ohlcv_not_stale(data, curr_date, symbol, canonical)
+        return data
+
+    ssu.load_ohlcv = _wide_load_ohlcv
+    mdv.load_ohlcv = _wide_load_ohlcv
+    yf_mod.load_ohlcv = _wide_load_ohlcv
+
+
 def get_pit_fundamentals_config(base_config: dict) -> dict:
     """Returns a copy of base_config with get_fundamentals routed to our
     PiT-safe vendor. Doesn't touch get_balance_sheet/get_cashflow/
@@ -511,13 +698,38 @@ def isolated_memory_path(system_name: str, base_dir: str = "./ta_memory") -> Pat
 def build_trading_agents_graph(system_name: str, base_config: dict, memory_base_dir: str = "./ta_memory"):
     """Constructs a fully patched TradingAgentsGraph: PiT fundamentals
     vendor registered, insider-transactions tool excluded, memory path
-    isolated to this system. Requires OpenAI/Anthropic/etc. credentials to
-    already be configured per TradingAgents' normal setup -- this function
-    only handles the three benchmark-integrity fixes, not general setup."""
-    register_pit_fundamentals_vendor()
-    config = get_pit_fundamentals_config(base_config)
+    isolated to this system, price-history fetch window widened to cover
+    this benchmark's full 2010-2023 episode range (see
+    register_wide_ohlcv_window -- without it, get_stock_data/
+    get_indicators/get_verified_market_snapshot fail outright for any
+    episode older than ~5 years before the real calendar date this is
+    run, which is 15 of this benchmark's 18 episodes). Requires
+    OpenAI/Anthropic/etc. credentials to already be configured per
+    TradingAgents' normal setup -- this function only handles
+    benchmark-integrity fixes, not general setup."""
+    from tradingagents.default_config import DEFAULT_CONFIG
 
-    os.environ["TRADINGAGENTS_MEMORY_LOG_PATH"] = str(isolated_memory_path(system_name, memory_base_dir))
+    register_pit_fundamentals_vendor()
+    register_wide_ohlcv_window()
+    # Merge over a fresh DEFAULT_CONFIG copy rather than trusting
+    # base_config alone: TradingAgentsGraph.__init__ does `self.config =
+    # config or DEFAULT_CONFIG` -- no per-key fallback -- so a caller
+    # passing a partial dict (e.g. just llm_provider/deep_think_llm/
+    # quick_think_llm, which is the natural thing to pass) previously hit
+    # `self.config["data_cache_dir"]` with that key entirely absent: a
+    # guaranteed KeyError on every construction, confirmed live.
+    config = get_pit_fundamentals_config({**DEFAULT_CONFIG, **base_config})
+
+    # Set memory_log_path directly on our own config dict rather than via
+    # the TRADINGAGENTS_MEMORY_LOG_PATH env var: DEFAULT_CONFIG bakes that
+    # env var's value in at the *first* time tradingagents.default_config
+    # is imported anywhere in the process (a module-level dict, evaluated
+    # once and cached) -- callers typically import it once already just to
+    # build base_config, before ever reaching this function, so setting
+    # the env var here is too late to change the already-materialized
+    # DEFAULT_CONFIG. Writing the key onto our own dict has no such
+    # ordering dependency and is what actually reaches self.config.
+    config["memory_log_path"] = str(isolated_memory_path(system_name, memory_base_dir))
 
     GraphClass = make_benchmark_safe_graph_class()
     return GraphClass(config=config)
@@ -544,59 +756,285 @@ RATING_TO_TARGET_FRACTION = {
 
 MIN_REBALANCE_NOTIONAL = 1.0  # skip order submission below this $ delta (avoid dust-sized orders)
 
+# Confirmed live, in the real full run before this fix existed: at
+# n_workers=10 (one worker per ticker, fully parallel), roughly 7 of every
+# 10 concurrent propagate() calls hit openai.RateLimitError (HTTP 429,
+# "RateLimitReached") against the Azure Kimi-K2.6 deployment -- recurring
+# every real decision-wave (roughly every 6-7 minutes), not just a
+# startup burst. Before this fix, _rate_and_build_order's blanket
+# `except Exception` treated a 429 identically to a genuine failure --
+# one immediate give-up, logged, silently defaulted to Hold. That is
+# exactly the failure mode already called out in this project's own
+# azure_llm.py retry logic and in CoordinationMeter's design notes ("an
+# unretried transient failure silently becomes a HOLD indistinguishable
+# from a real decision, confounding infrastructure noise with trading
+# behavior") -- it just hadn't been applied here yet. A rate-limited
+# ticker on ~70% of real decisions is not a minor availability blip; it
+# would have made most of a paid run's "decisions" rate-limit noise
+# rather than TradingAgents' actual output.
+#
+# A first version of this retry (fixed exponential backoff, no jitter)
+# was itself confirmed live to be insufficient on its own: with
+# n_workers=10, every worker hits the limit at nearly the same instant
+# (they all started concurrently), backs off on the identical schedule,
+# and then all retry in near-lockstep -- reproducing the same burst, and
+# the same 429, on every retry cycle. Observed live as a 15-minute stretch
+# with almost no forward progress (CPU time barely moved while wall clock
+# did) rather than a clean recover-and-continue. Random jitter on the
+# delay is the standard fix for exactly this thundering-herd pattern --
+# it desynchronizes concurrent retriers so they stop arriving at the
+# limit together.
+_RATE_LIMIT_MAX_RETRIES = 6
+_RATE_LIMIT_BASE_DELAY_SECONDS = 20.0
+_RATE_LIMIT_MAX_DELAY_SECONDS = 180.0
+_RATE_LIMIT_JITTER_FRACTION = 0.5  # actual delay = base * uniform(1 - frac, 1 + frac)
 
-def build_trading_agents_adapter(ta_graph, tickers: list[str], notional_per_ticker: float = 10_000.0) -> AgentFn:
-    """Returns an AgentFn (matching the interface in section 2) that calls
-    the given (already-patched) TradingAgentsGraph once per ticker per day
-    and translates its rating into a rebalancing Order.
+
+class TradingAgentsAdapter:
+    """CoordinationMeter-compatible AgentFn: rates every ticker each day
+    against a POOL of already-patched TradingAgentsGraph instances and
+    translates each rating into a rebalancing Order. Also exposes
+    last_usage(), so CoordinationMeter meters this on REAL measured token
+    counts (its "way 1", most trustworthy) instead of falling back to an
+    assumed per-call estimate or wall-clock-only.
+
+    Takes a pool of graph instances -- build several via
+    build_trading_agents_graph with the same system_name/config (so they
+    share one isolated memory log) and pass them as a list -- rather than
+    a single shared instance. propagate() mutates
+    self.ticker/self.graph/self._checkpointer_ctx directly on the graph
+    object (confirmed by reading trading_graph.py), so two tickers rated
+    concurrently on ONE shared instance would silently contaminate each
+    other's runs. With len(ta_graph_pool) instances, up to that many
+    tickers rate concurrently instead of one at a time; the dominant
+    per-ticker cost is real, sequential LLM latency inside propagate()
+    (13-16 calls observed for a single ticker/day at this framework's own
+    minimum debate-round setting), which this does not reduce in content,
+    only in how many tickers pay that cost simultaneously. The memory
+    log's own write (tradingagents/agents/utils/memory.py:store_decision)
+    is an unlocked read-then-append, so concurrent writers can
+    occasionally produce a duplicate "pending" entry for the same
+    ticker+date -- accepted, since it only affects a future
+    self-reflection prompt's context, not the rating returned for any
+    ticker on any day.
+
+    Usage measurement: each ticker's propagate() call runs inside a fresh
+    langchain_core UsageMetadataCallbackHandler context
+    (get_usage_metadata_callback() -- a context-var-based global hook, so
+    it captures every LangChain chat-model call made anywhere inside
+    LangGraph's execution, without TradingAgents needing to accept or
+    forward a callbacks= parameter itself). Being context-var-based, it is
+    correctly isolated per worker thread with no extra locking needed on
+    our side. TradingAgents mixes two real models per decision --
+    deep_think_llm (Sonnet, the expensive multi-round analysis/debate/risk
+    calls) and quick_think_llm (Haiku, lighter calls) -- but
+    CoordinationCostConfig prices a whole system at ONE $/token rate via
+    cfg.model. last_usage() reports the real total input/output tokens
+    summed across BOTH models; run_tradingagents_episodes.py sets
+    cfg.model="claude-sonnet-5" (the more expensive of the two), so the
+    dollar figure CoordinationMeter derives from this is a real measured
+    token count priced at a deliberately conservative upper bound, not an
+    exact blended figure -- true_blended_cost_usd() below computes the
+    exact number (each model's real tokens at its own real rate) as a
+    separately-reported supplement.
 
     Note this makes one full multi-agent LLM run per ticker per day --
-    expect this to be slow and to cost real API credits at scale. Consider
-    testing on a small ticker list and a short date range first."""
+    expect this to cost real API credits at scale even with concurrency.
+    Consider testing on a small ticker list and a short date range
+    first."""
 
-    def agent(decision_snapshots, positions, cash, as_of):
-        orders = []
+    def __init__(self, ta_graph_pool: Sequence, tickers: list[str],
+                 notional_per_ticker: float = 10_000.0):
+        self._graph_pool: "queue.Queue" = queue.Queue()
+        for g in ta_graph_pool:
+            self._graph_pool.put(g)
+        self.n_agents = len(ta_graph_pool)
+        self.tickers = tickers
+        self.notional_per_ticker = notional_per_ticker
+        self._last_usage_by_model: dict[str, dict[str, int]] = {}
+        # Running total across every __call__ since construction --
+        # true_blended_cost_usd() only ever reflects the MOST RECENT call,
+        # which run_tradingagents_episodes.py's first version wrongly
+        # summed once per episode (after run_episode() had already made
+        # many calls internally), silently reporting only the last
+        # decision's cost as if it were the whole episode's. Found during
+        # a pre-run code review, not in a live run.
+        self._cumulative_usage_by_model: dict[str, dict[str, int]] = {}
+
+    def _rate_and_build_order(self, ticker, as_of, decision_snapshots, positions):
+        from langchain_core.callbacks import get_usage_metadata_callback
+
         trade_date = as_of.strftime("%Y-%m-%d")
+        snap = decision_snapshots.get(ticker, {})
+        prices = snap.get("prices")
+        if prices is None or prices.empty:
+            return None, {}
+        last_close = float(prices.sort_values("date").iloc[-1]["adj_close"])
+        if last_close <= 0:
+            return None, {}
 
-        for ticker in tickers:
-            snap = decision_snapshots.get(ticker, {})
-            prices = snap.get("prices")
-            if prices is None or prices.empty:
-                continue
-            last_close = float(prices.sort_values("date").iloc[-1]["adj_close"])
-            if last_close <= 0:
-                continue
+        graph = self._graph_pool.get()
 
-            try:
-                _, rating = ta_graph.propagate(ticker, trade_date)
-            except Exception:
-                # A single failed LLM call (rate limit, provider hiccup,
-                # malformed response) shouldn't crash an entire multi-year
-                # backtest -- treat it as a no-trade day for this ticker
-                # and move on, same as run_episode already does for a
-                # crashing agent_fn at the whole-day level.
-                continue
+        def _propagate_and_capture_usage():
+            # get_usage_metadata_callback's registration is contextvars-based,
+            # and a raw threading.Thread does NOT inherit the spawning
+            # thread's contextvars.Context -- confirmed live: entering this
+            # context manager around the OUTSIDE of
+            # _request_with_hard_timeout (which runs graph.propagate on a
+            # freshly spawned daemon thread, see azure_llm.py) captured
+            # zero tokens despite a real, complete, 7+ minute propagate()
+            # call underneath it. The context has to be entered INSIDE the
+            # function that actually runs on that daemon thread, which is
+            # what this closure exists for.
+            with get_usage_metadata_callback() as cb:
+                result = graph.propagate(ticker, trade_date)
+            return result, dict(cb.usage_metadata)
 
-            target_fraction = RATING_TO_TARGET_FRACTION.get(rating)
-            if target_fraction is None:
-                continue  # Hold, or an unrecognized rating string
+        import openai
 
-            target_qty = (target_fraction * notional_per_ticker) / last_close
-            current_qty = positions.get(ticker, 0.0)
-            delta_qty = target_qty - current_qty
+        delay = _RATE_LIMIT_BASE_DELAY_SECONDS
+        try:
+            for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
+                try:
+                    (_, rating), usage_by_model = _request_with_hard_timeout(
+                        _propagate_and_capture_usage,
+                        hard_timeout=_PROPAGATE_HARD_TIMEOUT_SECONDS,
+                    )
+                    break
+                except openai.RateLimitError as exc:
+                    if attempt == _RATE_LIMIT_MAX_RETRIES:
+                        raise
+                    jittered = delay * random.uniform(
+                        1 - _RATE_LIMIT_JITTER_FRACTION, 1 + _RATE_LIMIT_JITTER_FRACTION
+                    )
+                    log.warning(
+                        "%s on %s: rate limited (attempt %d/%d), retrying in %.0fs: %s",
+                        ticker, trade_date, attempt + 1, _RATE_LIMIT_MAX_RETRIES, jittered, exc,
+                    )
+                    time.sleep(jittered)
+                    delay = min(delay * 2, _RATE_LIMIT_MAX_DELAY_SECONDS)
+        except Exception:
+            # A genuine failure (not a rate limit -- those are retried
+            # above) or a stalled propagate() call (see
+            # _PROPAGATE_HARD_TIMEOUT_SECONDS -- TradingAgents' Yahoo
+            # Finance tools have no reliable timeout of their own,
+            # confirmed live) shouldn't crash an entire multi-year
+            # backtest -- treat it as a no-trade day for this ticker
+            # and move on, same as run_episode already does for a
+            # crashing agent_fn at the whole-day level. Logged (not just
+            # swallowed) -- this except block previously had no logging at
+            # all, so a systematic failure (e.g. every real call failing
+            # the same way) would produce zero fills and zero cost with no
+            # visible cause, indistinguishable from "every day was a
+            # legitimate Hold."
+            log.exception("propagate() failed for %s on %s -- treating as Hold", ticker, trade_date)
+            return None, {}
+        finally:
+            self._graph_pool.put(graph)
 
-            if abs(delta_qty * last_close) < MIN_REBALANCE_NOTIONAL:
-                continue
+        target_fraction = RATING_TO_TARGET_FRACTION.get(rating)
+        if target_fraction is None:
+            return None, usage_by_model  # Hold, or an unrecognized rating string
 
-            side = OrderSide.BUY if delta_qty > 0 else OrderSide.SELL
-            orders.append(Order(
-                order_id="", timestamp=as_of.isoformat(), symbol=ticker,
-                side=side, order_type=OrderType.MARKET, quantity=abs(delta_qty),
-            ))
+        target_qty = (target_fraction * self.notional_per_ticker) / last_close
+        current_qty = positions.get(ticker, 0.0)
+        delta_qty = target_qty - current_qty
 
+        if abs(delta_qty * last_close) < MIN_REBALANCE_NOTIONAL:
+            return None, usage_by_model
+
+        side = OrderSide.BUY if delta_qty > 0 else OrderSide.SELL
+        order = Order(
+            order_id="", timestamp=as_of.isoformat(), symbol=ticker,
+            side=side, order_type=OrderType.MARKET, quantity=abs(delta_qty),
+        )
+        return order, usage_by_model
+
+    def __call__(self, decision_snapshots, positions, cash, as_of):
+        orders = []
+        combined: dict[str, dict[str, int]] = {}
+        n_calls = 0
+        with ThreadPoolExecutor(max_workers=self.n_agents) as pool:
+            futures = [
+                pool.submit(self._rate_and_build_order, ticker, as_of, decision_snapshots, positions)
+                for ticker in self.tickers
+            ]
+            for future in as_completed(futures):
+                order, usage_by_model = future.result()
+                if order is not None:
+                    orders.append(order)
+                for raw_model_name, um in usage_by_model.items():
+                    # response_metadata["model_name"] is inconsistent across
+                    # both model families AND routes -- confirmed live twice:
+                    # (1) langchain-anthropic: Haiku 4.5 comes back dated
+                    # ("claude-haiku-4-5-20251001"), Sonnet 5 undated
+                    # ("claude-sonnet-5"), same SDK version. (2) the Azure
+                    # Foundry DeepSeek deployment routed through
+                    # langchain_openai.ChatOpenAI echoes back the exact
+                    # deployment name as configured in the portal
+                    # ("DeepSeek-V4-Pro"), not the lowercase alias
+                    # coordination_cost.MODEL_PRICES is keyed on
+                    # ("deepseek-v4-pro") -- confirmed live: this silently
+                    # zeroed true_blended_cost_usd() with no error, not an
+                    # imprecise number but a wrong one (price=None ->
+                    # excluded, not just uncredited). Strip a trailing
+                    # -YYYYMMDD if present and lowercase; a no-op on names
+                    # that already match.
+                    model_name = re.sub(r"-\d{8}$", "", raw_model_name).lower()
+                    n_calls += 1
+                    agg = combined.setdefault(model_name, {"input_tokens": 0, "output_tokens": 0})
+                    agg["input_tokens"] += int(um["input_tokens"])
+                    agg["output_tokens"] += int(um["output_tokens"])
+        self._last_usage_by_model = combined
+        self._last_n_calls = n_calls
+        for model_name, m in combined.items():
+            cum = self._cumulative_usage_by_model.setdefault(model_name, {"input_tokens": 0, "output_tokens": 0})
+            cum["input_tokens"] += m["input_tokens"]
+            cum["output_tokens"] += m["output_tokens"]
         return orders
 
-    return agent
+    def last_usage(self) -> dict:
+        """CoordinationMeter's real-measurement path (see class docstring
+        for the single-price-vs-mixed-model caveat)."""
+        total_in = sum(m["input_tokens"] for m in self._last_usage_by_model.values())
+        total_out = sum(m["output_tokens"] for m in self._last_usage_by_model.values())
+        return {
+            "llm_calls": self._last_n_calls,
+            "input_tokens": total_in,
+            "output_tokens": total_out,
+            "messages": max(self.n_agents - 1, 0),
+        }
+
+    @staticmethod
+    def _price_usage_by_model(usage_by_model: dict[str, dict[str, int]]) -> float:
+        from coordination_cost import MODEL_PRICES
+
+        total = 0.0
+        for model_name, usage in usage_by_model.items():
+            price = MODEL_PRICES.get(model_name)
+            if price is None:
+                log.warning("no MODEL_PRICES entry for %r -- excluded from cost total", model_name)
+                continue
+            total += (usage["input_tokens"] * price.input_per_mtok
+                      + usage["output_tokens"] * price.output_per_mtok) / 1_000_000.0
+        return total
+
+    def true_blended_cost_usd(self) -> float:
+        """Exact dollar cost for the most recent __call__ ONLY: each
+        model's real measured tokens priced at that model's own real
+        MODEL_PRICES rate, summed -- not an approximation, but also not a
+        running total. Use cumulative_true_blended_cost_usd() for the
+        total across an episode or a full run -- conflating the two is
+        exactly the bug that motivated splitting them (see
+        _cumulative_usage_by_model's comment in __init__)."""
+        return self._price_usage_by_model(self._last_usage_by_model)
+
+    def cumulative_true_blended_cost_usd(self) -> float:
+        """Exact dollar cost across every __call__ since construction --
+        the number to report for an episode or a full run. Supplements
+        (does not replace) CoordinationMeter's own report, which prices
+        the total at one rate (see class docstring)."""
+        return self._price_usage_by_model(self._cumulative_usage_by_model)
 
 
 # ---------------------------------------------------------------------------
@@ -655,8 +1093,18 @@ def temporal_integrity_report(episodes: Sequence[EpisodeRun]) -> TemporalIntegri
     are distinguished from ordinary loader calls by dataset names your
     check() call sites choose (e.g. "agent_message", "tool_output"); this
     function treats any access_log entry whose dataset name is not one of
-    the three raw loaders as an explicit check and sums its violations."""
-    ORDINARY_LOADERS = {"prices", "news", "fundamentals"}
+    the raw loaders as an explicit check and sums its violations. Kept in
+    sync with dataprep.PointInTimeStore's own loader methods by name (not by
+    import, to avoid a phase3<->dataprep cycle) -- prices/news/fundamentals
+    plus the three added since: bars_as_of ("intraday_bars"), quotes_as_of
+    ("quotes"), corporate_actions_as_of ("corporate_actions"). Not currently
+    reachable from main.py's --agent llm path (phase3.run_episode's own
+    store only ever calls snapshot_as_of), but Phase15Bridge.run_day and
+    cbs.py both call quotes_as_of directly -- if either is ever wired into a
+    JointMetricReport, an incomplete set here would misreport every ordinary
+    quote-blocking event as a genuine temporal-integrity violation."""
+    ORDINARY_LOADERS = {"prices", "news", "fundamentals",
+                         "intraday_bars", "quotes", "corporate_actions"}
     total_q = total_ret = total_blk = total_check_violations = 0
     checked_episodes = []
     for ep in episodes:
@@ -679,17 +1127,76 @@ def temporal_integrity_report(episodes: Sequence[EpisodeRun]) -> TemporalIntegri
     )
 
 
-def sharpe_ratio(daily_returns: pd.Series, periods_per_year: int = TRADING_DAYS_PER_YEAR) -> float:
-    if daily_returns.empty or daily_returns.std(ddof=1) == 0:
-        return float("nan")
-    return float(daily_returns.mean() / daily_returns.std(ddof=1) * np.sqrt(periods_per_year))
+def _excess_returns(daily_returns: pd.Series, rf: "pd.Series | float") -> pd.Series:
+    """`daily_returns - rf`, aligned by date when `rf` is a Series.
+
+    rf defaults to 0.0 everywhere it's threaded through below (SPY-proxy
+    factor fallback has no rf column, and pre-fix callers that never pass rf
+    at all get identical behavior to before this fix) -- passing 0.0 is a
+    deliberate no-op, not an approximation. When `rf` IS a real Series
+    (dataprep.load_factors()'s decimal-scaled Ken French daily rate), a date
+    missing from it is filled with 0.0 rather than dropped, so this never
+    changes the observation COUNT feeding Sharpe/Sortino/alpha -- only a
+    genuinely absent rf quote for that day, which practice treats as "no
+    adjustment" rather than as a reason to lose the return observation."""
+    if isinstance(rf, (int, float)):
+        return daily_returns - float(rf)
+    return daily_returns - rf.reindex(daily_returns.index).fillna(0.0)
 
 
-def sortino_ratio(daily_returns: pd.Series, periods_per_year: int = TRADING_DAYS_PER_YEAR) -> float:
-    downside = daily_returns[daily_returns < 0]
-    if daily_returns.empty or downside.empty or downside.std(ddof=1) == 0:
+_DEGENERATE_RETURN_STD = 1e-9   # see _is_degenerate's docstring
+
+
+def _is_degenerate(daily_returns: pd.Series) -> bool:
+    """True when the RAW strategy produced no real variation -- a fully
+    flat episode (e.g. the agent never traded, so portfolio value never
+    changed and every return is exactly 0.0). Checked on the raw returns,
+    NOT on rf-adjusted excess returns: confirmed live, a real
+    deepseek-v4-pro episode (2019-05-26..2019-08-24, zero fills) had raw
+    returns of exactly 0.0 every day, but rf (the real daily Ken French
+    rate) varies slightly day to day -- so `excess = 0 - rf` is NOT exactly
+    constant, giving excess.std(ddof=1) a tiny but nonzero value from rf's
+    own wiggle alone, unrelated to anything the strategy did. Dividing by
+    that produced a Sharpe of -9.68e15, printed and nearly shipped in a
+    real report before this was caught. A strategy that did nothing should
+    always read NaN, regardless of how much the risk-free rate itself
+    happened to jitter that week -- checking degeneracy on the raw returns
+    (which genuinely are exactly constant here) fixes this at the source
+    rather than patching the symptom with a looser tolerance on the
+    rf-adjusted series, which would just move the blowup threshold rather
+    than remove its cause. A small tolerance (not exact ==0) guards the
+    same case for near-flat (not bit-for-bit-identical) raw returns, e.g.
+    floating-point noise from repeated arithmetic rather than genuine
+    signal."""
+    return daily_returns.empty or daily_returns.std(ddof=1) < _DEGENERATE_RETURN_STD
+
+
+def sharpe_ratio(daily_returns: pd.Series, periods_per_year: int = TRADING_DAYS_PER_YEAR,
+                  rf: "pd.Series | float" = 0.0) -> float:
+    if _is_degenerate(daily_returns):
         return float("nan")
-    return float(daily_returns.mean() / downside.std(ddof=1) * np.sqrt(periods_per_year))
+    excess = _excess_returns(daily_returns, rf)
+    return float(excess.mean() / excess.std(ddof=1) * np.sqrt(periods_per_year))
+
+
+def sortino_ratio(daily_returns: pd.Series, periods_per_year: int = TRADING_DAYS_PER_YEAR,
+                   rf: "pd.Series | float" = 0.0) -> float:
+    """Downside deviation per the standard definition (Sortino & Price 1994,
+    also what most quant libraries implement): target semi-deviation over
+    ALL N observations, sqrt(mean(min(r_i - MAR, 0)^2)) with MAR = rf.
+    The previous version computed std(ddof=1) of only the negative-return
+    SUBSET, centered on that subset's own mean rather than on MAR/0 and
+    divided by (n_downside - 1) rather than N -- a different, non-standard
+    statistic that doesn't reduce to the textbook one by a constant factor,
+    so a reviewer checking the definition against Sortino & Price would not
+    be able to reproduce these numbers from the paper's stated formula."""
+    if _is_degenerate(daily_returns):
+        return float("nan")
+    excess = _excess_returns(daily_returns, rf)
+    downside_dev = float(np.sqrt(np.mean(np.minimum(excess.to_numpy(), 0.0) ** 2)))
+    if downside_dev < _DEGENERATE_RETURN_STD:
+        return float("nan")
+    return float(excess.mean() / downside_dev * np.sqrt(periods_per_year))
 
 
 def max_drawdown(portfolio_values: pd.Series) -> float:
@@ -744,24 +1251,32 @@ class EpisodeMetrics:
     daily_returns: pd.Series = field(repr=False)
 
 
-def episode_metrics(ep: EpisodeRun) -> EpisodeMetrics:
+def episode_metrics(ep: EpisodeRun, rf: "pd.Series | float" = 0.0) -> EpisodeMetrics:
     rets = ep.daily_returns()
     return EpisodeMetrics(
         episode_start=ep.episode_start,
         regime=ep.regime,
         net_return=net_monetary_return(ep.portfolio_values),
-        sharpe=sharpe_ratio(rets),
-        sortino=sortino_ratio(rets),
+        sharpe=sharpe_ratio(rets, rf=rf),
+        sortino=sortino_ratio(rets, rf=rf),
         max_drawdown=max_drawdown(ep.portfolio_values),
         breakeven_bps=execution_breakeven_bps(ep.execution_log),
         daily_returns=rets,
     )
 
 
-def executable_performance_table(episodes: Sequence[EpisodeRun]) -> pd.DataFrame:
+def executable_performance_table(episodes: Sequence[EpisodeRun], rf: "pd.Series | float" = 0.0) -> pd.DataFrame:
     """One row per episode -- the raw material for both the Executable
-    Performance summary and the Regime Robustness groupby below."""
-    rows = [dataclasses.asdict(episode_metrics(ep)) for ep in episodes]
+    Performance summary and the Regime Robustness groupby below.
+
+    `rf` defaults to 0.0 (no adjustment -- identical to this function's
+    behavior before risk-free-rate handling existed at all). Pass the real
+    daily Ken French rf series (dataprep.load_factors()["rf"]) to report
+    Sharpe/Sortino on excess returns, consistent with factor_attribution's
+    alpha, which regresses against Mkt-RF (already excess) -- mixing a raw
+    return Sharpe with an excess-return alpha in the same report would be an
+    internally inconsistent pair of numbers."""
+    rows = [dataclasses.asdict(episode_metrics(ep, rf=rf)) for ep in episodes]
     df = pd.DataFrame(rows).drop(columns=["daily_returns"])
     return df.sort_values("episode_start").reset_index(drop=True)
 
@@ -821,22 +1336,37 @@ def factor_attribution(
     factor_returns: pd.DataFrame,
     periods_per_year: int = TRADING_DAYS_PER_YEAR,
 ) -> AttributionResult:
-    """Regresses the agent's daily returns on daily style factor returns.
-    `factor_returns` must be date-indexed with at least a "mkt" column
-    (Market) -- "smb" (Size), "hml" (Value), "rmw" (Profitability), "cma"
-    (Investment), and "mom" (Momentum) are each included in the regression
-    if present, so this adapts to whatever factor set was actually sourced
-    (see dataprep.build_factors for the full 6-factor build, or
-    main.load_factor_returns for the --factors FILE / SPY-proxy fallbacks).
-    You're responsible for aligning its index timezone/frequency to the
-    portfolio value series before calling this.
+    """Regresses the agent's EXCESS daily returns on daily style factor
+    returns. `factor_returns` must be date-indexed with at least a "mkt"
+    column (Market) -- "smb" (Size), "hml" (Value), "rmw" (Profitability),
+    "cma" (Investment), and "mom" (Momentum) are each included in the
+    regression if present, so this adapts to whatever factor set was
+    actually sourced (see dataprep.build_factors for the full 6-factor
+    build, or main.load_factor_returns for the --factors FILE / SPY-proxy
+    fallbacks). You're responsible for aligning its index timezone/frequency
+    to the portfolio value series before calling this.
+
+    The standard Fama-French specification is R_portfolio - RF = alpha +
+    beta*(Mkt-RF) + ... -- and dataprep.build_factors' "mkt" column IS
+    already Mkt-RF (excess), by construction of the Ken French data itself.
+    If `factor_returns` carries an "rf" column (the real Ken French build
+    does; the SPY-only proxy in main.load_factor_returns does not), it is
+    subtracted from `daily_returns` here before the regression, so the LHS
+    and RHS are both in excess-return terms -- regressing a RAW agent return
+    against an already-excess Mkt-RF is an inconsistent specification that
+    biases alpha by roughly rf * (1 - net factor exposure), which is not
+    negligible across a date range spanning the 2022-2023 rate-hike period.
+    Falls back to rf=0.0 (unchanged prior behavior) when no "rf" column is
+    present, e.g. the SPY-proxy path.
 
     Alpha is annualized (daily alpha * periods_per_year) and reported as
     factor-adjusted residual performance, per the proposal's framing --
     this is NOT a claim of "genuine skill," just the return unexplained by
     whatever style factors were included."""
     factor_cols = _available_factor_cols(factor_returns)
-    aligned = pd.concat([daily_returns.rename("ret"), factor_returns[factor_cols]],
+    rf = factor_returns["rf"] if "rf" in factor_returns.columns else 0.0
+    excess_returns = _excess_returns(daily_returns, rf).rename("ret")
+    aligned = pd.concat([excess_returns, factor_returns[factor_cols]],
                          axis=1, join="inner").dropna()
     if len(aligned) < 5:
         log.warning("factor_attribution: only %d aligned observations, results unreliable", len(aligned))
@@ -885,8 +1415,20 @@ def block_bootstrap_ci(
     window being reported as if it were a stable result. `factor_returns`
     is required (and resampled in lockstep with the returns, via shared
     block indices) when metric == "alpha", since alpha needs matched
-    agent/factor observations on each resample."""
-    rets = daily_returns.dropna()
+    agent/factor observations on each resample.
+
+    Every metric here is computed on EXCESS returns when `factor_returns`
+    carries an "rf" column -- same rf treatment as sharpe_ratio/
+    sortino_ratio/factor_attribution, kept consistent so a Sharpe CI and an
+    alpha CI reported side by side in the same table are answering the same
+    "excess of what" question rather than silently mixing raw and
+    excess-return conventions. Falls back to rf=0.0 (no adjustment,
+    unchanged prior behavior) when factor_returns is None or lacks "rf"
+    (e.g. metric in {"sharpe","sortino"} called with no factor context at
+    all, or the SPY-proxy fallback)."""
+    rf = (factor_returns["rf"] if factor_returns is not None and "rf" in factor_returns.columns
+          else 0.0)
+    rets = _excess_returns(daily_returns, rf).dropna()
     n = len(rets)
     if n < block_size:
         raise ValueError(f"need at least {block_size} return observations, got {n}")
@@ -907,6 +1449,8 @@ def block_bootstrap_ci(
     else:
         rets_arr = rets.to_numpy()
         fac_arr = None
+        # rf already applied above (rets is excess); pass rf=0.0 here so
+        # sharpe_ratio/sortino_ratio don't subtract it a second time.
         fn = {"sharpe": sharpe_ratio, "sortino": sortino_ratio}[metric]
 
         def point(r, f):
@@ -968,7 +1512,15 @@ def factor_attribution_ablation(
     for spec_name, wanted_cols in FACTOR_SPECS.items():
         if not all(c in factor_returns.columns for c in wanted_cols):
             continue
-        restricted = factor_returns[list(wanted_cols)]
+        # "rf" is carried along (not a regressor -- not in wanted_cols) so
+        # factor_attribution/block_bootstrap_ci can find it and regress
+        # excess-of-rf returns at every spec size, not just when the full,
+        # unrestricted factor_returns happens to be passed elsewhere. Without
+        # this, every row of the ablation table would silently fall back to
+        # rf=0.0 regardless of the top-level rf fix, since restricted's
+        # column set never included it.
+        restrict_cols = list(wanted_cols) + (["rf"] if "rf" in factor_returns.columns else [])
+        restricted = factor_returns[restrict_cols]
         attribution = factor_attribution(daily_returns, restricted, periods_per_year)
         alpha_ci = block_bootstrap_ci(daily_returns, factor_returns=restricted, metric="alpha",
                                        n_boot=n_boot, block_size=block_size, seed=seed)
@@ -1048,7 +1600,14 @@ def build_joint_metric_report(
     one agent system over its assigned episodes. `factor_returns` is shared
     across systems (same market conditions -> comparable attribution)."""
     ti = temporal_integrity_report(episodes)
-    perf = executable_performance_table(episodes)
+    # rf: the real Ken French build carries a daily risk-free rate; the
+    # SPY-proxy fallback (main.load_factor_returns, no data build available)
+    # does not. Falls back to 0.0 (no adjustment) in that case, which is the
+    # same behavior every one of these functions had before this fix existed
+    # -- so a run without real factor data isn't newly broken, just not
+    # excess-return-adjusted.
+    rf = factor_returns["rf"] if "rf" in factor_returns.columns else 0.0
+    perf = executable_performance_table(episodes, rf=rf)
     regime = regime_robustness_table(perf)
 
     # Concatenate daily returns across episodes for the aggregate attribution
@@ -1059,10 +1618,15 @@ def build_joint_metric_report(
     all_returns = all_returns[~all_returns.index.duplicated(keep="first")]
 
     attribution = factor_attribution(all_returns, factor_returns)
-    sharpe_ci = block_bootstrap_ci(all_returns, metric="sharpe", n_boot=n_boot,
-                                    block_size=block_size, seed=seed)
-    sortino_ci = block_bootstrap_ci(all_returns, metric="sortino", n_boot=n_boot,
-                                     block_size=block_size, seed=seed)
+    # factor_returns passed to the sharpe/sortino CIs too (not just alpha's),
+    # so all three CIs in one report answer the same "excess of what"
+    # question -- previously these two calls omitted it entirely, meaning
+    # the Sharpe/Sortino CI would silently use raw returns even once alpha
+    # started using excess returns, an internally inconsistent report.
+    sharpe_ci = block_bootstrap_ci(all_returns, factor_returns=factor_returns, metric="sharpe",
+                                    n_boot=n_boot, block_size=block_size, seed=seed)
+    sortino_ci = block_bootstrap_ci(all_returns, factor_returns=factor_returns, metric="sortino",
+                                     n_boot=n_boot, block_size=block_size, seed=seed)
     alpha_ci = block_bootstrap_ci(all_returns, factor_returns=factor_returns, metric="alpha",
                                    n_boot=n_boot, block_size=block_size, seed=seed)
     ablation = factor_attribution_ablation(all_returns, factor_returns, n_boot=n_boot,

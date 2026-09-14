@@ -141,18 +141,66 @@ class ExecutionReplayEngine:
                 is_maker = True
                 base_price = order.limit_price
 
-        # 4. Compute Non-Linear Market Impact
-        impact_pct = self._calculate_market_impact(fill_qty, snapshot)
+        # 4. Compute Non-Linear Market Impact -- taker fills only. Impact
+        # models the cost of CONSUMING liquidity (walking the book against
+        # yourself); a maker fill rests in the book at base_price and gets
+        # filled there, not pushed further by its own size. Applying impact
+        # to a POST_ONLY/resting-LIMIT fill previously overstated exactly
+        # the order type meant to be cheapest, understating the benefit of
+        # providing liquidity.
+        impact_pct = 0.0 if is_maker else self._calculate_market_impact(fill_qty, snapshot)
 
         if order.side == OrderSide.BUY:
             execution_price = base_price * (1.0 + impact_pct)
-            slippage = execution_price - snapshot.ask_price
         else:
             execution_price = base_price * (1.0 - impact_pct)
+
+        # 4b. A LIMIT order -- resting or marketable -- can never execute
+        # worse than its own stated limit; that guarantee is what makes it a
+        # limit order rather than a market order. Resting fills already
+        # satisfy this trivially (base_price == limit_price, impact == 0
+        # since is_maker is True above). This specifically catches a
+        # MARKETABLE limit (crosses the spread, so is_maker stayed False and
+        # it took impact like a MARKET order would): without this clamp,
+        # high-impact conditions (crisis regime, thin depth, large
+        # quantity/ADV ratio) could push execution_price past the price the
+        # agent was actually willing to accept -- impossible in a real
+        # market, since the order simply would not have filled there.
+        if order.order_type == OrderType.LIMIT and order.limit_price is not None:
+            if order.side == OrderSide.BUY:
+                execution_price = min(execution_price, order.limit_price)
+            else:
+                execution_price = max(execution_price, order.limit_price)
+
+        if order.side == OrderSide.BUY:
+            slippage = execution_price - snapshot.ask_price
+        else:
             slippage = snapshot.bid_price - execution_price
 
-        # 5. Fee Accounting
+        # 4c. Cash-sufficiency clip -- BUY orders only. The liquidity clip
+        # (step 2) bounds fill_qty against order book depth, known before
+        # execution_price is determined; real affordability additionally
+        # depends on execution_price (impact/spread applied above) plus the
+        # fee below, neither of which the pre-decision validator
+        # (phase1_5_agent._validate_decision's `max_affordable = cash /
+        # last_price`, using the PRIOR close with no fee/spread/impact) can
+        # account for. This engine is the only place that knows the real
+        # execution price, so it's the right place to enforce the real
+        # constraint -- without this, a BUY the validator approved as
+        # "exactly affordable" can cost more than cash_balance once the
+        # actual ask/impact/fee are applied, and _update_portfolio below
+        # applies that debit unconditionally with no floor at zero: cash
+        # would go negative silently, corrupting every subsequent day's
+        # portfolio value for the rest of the episode. Confirmed not yet
+        # triggered in any completed run (checked: minimum portfolio value
+        # across every existing runs/*.json stays comfortably positive), but
+        # a real, live gap for the runs about to launch, not a hypothetical.
         fee_bps = self.config.maker_fee_bps if is_maker else self.config.taker_fee_bps
+        if order.side == OrderSide.BUY and execution_price > 0:
+            max_affordable_qty = self.cash_balance / (execution_price * (1.0 + fee_bps / 10000.0))
+            fill_qty = min(fill_qty, max(max_affordable_qty, 0.0))
+
+        # 5. Fee Accounting
         notional_value = fill_qty * execution_price
         fee_paid = notional_value * (fee_bps / 10000.0)
 

@@ -1,0 +1,364 @@
+\documentclass{article}
+
+\usepackage[dblblindworkshop]{neurips_2026}
+% NOTE: track option set to dblblindworkshop (double-blind workshop review) as a default.
+% If IAEval uses single-blind review, swap to [sglblindworkshop]{neurips_2026}.
+% Add ", final" inside the brackets only once the paper is accepted, e.g. [dblblindworkshop, final]{neurips_2026}.
+\workshoptitle{Evaluation of Interactive Agents}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, citecolor=blue, linkcolor=blue, urlcolor=blue}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{wrapfig}
+
+\title{PIERCEBench: A Unified Benchmark for Financial Multi-Agent Systems in Joint Evaluation of Temporal Integrity, Execution Realism, and Coordination Value}
+
+\author{%
+  Anonymous Author(s) \\
+  Affiliation \\
+  Address \\
+  \texttt{email} \\
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Evaluating AI trading systems requires accounting for factors beyond their raw trading returns, including whether they use only information available at the time of a decision, how they perform under different market conditions, and the costs of executing and coordinating trades. To address this, we introduce PIERCEBench (Point-in-time Integrity, Impact Aware, Execution Realism, Regime robustness, Coordination value, Evaluation), a three-part evaluation pipeline combining point-in-time historical data, realistic trade execution, and quantitative performance analysis. The data pipeline preserves the information available at each historical timestamp, while the execution replay engine simulates bid-ask spreads, maker/taker fees, slippage, order sequencing, and fill mechanics. The evaluation stage measures temporal integrity, risk-adjusted returns, maximum drawdown, net return, execution-breakeven thresholds, and performance across different market regimes. We apply the pipeline to four backbone models and to TradingAgents, a multi-agent system evaluated with a matched backbone. All evaluated backbones maintained temporal integrity, while trading performance varied across models and market regimes. The multi-agent evaluation additionally accounts for the cost of agent coordination, allowing its performance to be considered alongside the computational cost required to operate it.
+\end{abstract}
+
+\section{Introduction}
+
+Recent LLM-based trading agents report a wide range of results, with claimed cumulative returns reaching over 400\%~\cite{li2025hedgeagents}, produced by architectures spanning memory-augmented single agents such as FinMem~\cite{yu2023finmem}, layered-memory debate systems, manager-analyst hierarchies such as FinCon~\cite{yu2024fincon}, multimodal and tool-augmented pipelines, fine-grained specialist workflows, and hybrid multi-agent-plus-reinforcement-learning architectures. Systems like TradingAgents~\cite{xiao2024ta} replicate a trading firm's dynamics through specialized analyst, trader, reflection, and risk roles connected by debate, reporting gains in cumulative return, Sharpe ratio, and drawdown as a result. This trend reflects the shift from static financial QA towards more closed-loop and autonomous agents that are able to perceive markets, reason, act, debate, and adapt over time~\cite{chen2021finqa}. It no longer centers around single prompt-to-prompt trading templates. However, as innovation in this design space has expanded, evaluation has not kept the same pace. Reporting of time-consistent data splits, transaction-cost models, and execution timing remains inconsistent across studies, and look-ahead bias~\cite{lopezdeprado2018}, backtest overfitting~\cite{bailey2014}, transaction-cost neglect, and regime-shift blindness can each reverse a system's apparent gains. Recent benchmarks provide direct evidence of this problem.
+
+StockBench~\cite{chen2025stockbench}: Evaluated 13 LLM trading agents over 82 trading days from March 3 to June 30, 2025 on 20 DJIA stocks, using an equal-weight buy-and-hold portfolio as the baseline. The passive baseline returned 0.4\%, with $-15.2\%$ maximum drawdown and a 0.0155 Sortino ratio, while agent returns ranged from $-2.8\%$ to $2.5\%$, topped by Qwen3-235B-Think; five models exceeded 2\% return, and five (GPT-5, Qwen3-Coder, DeepSeek-V3, and both GPT-OSS variants) underperformed the baseline. The top-ranked model, Kimi-K2, posted a 1.9\% return, a $-11.8\%$ drawdown, and a 0.0420 Sortino ratio, indicating better downside control than buy-and-hold even without the highest raw return. In terms of regime dependence, in the downturn subperiod, all LLM agents failed to beat the passive baseline, whereas most surpassed it in the upturn period.
+
+AI-Trader~\cite{fan2025aitrader}: an autonomous, data-uncontaminated benchmark spanning U.S. equities, A-shares, and cryptocurrencies, where six LLM agents independently search, verify, and synthesize market information before making trades in real-time markets. Results show that only 3 of 6 agents beat the U.S. QQQ benchmark, with MiniMax-M2 achieving the strongest performance at $+9.56\%$ versus QQQ's $+1.87\%$, followed by DeepSeek-v3.1 at $+8.39\%$ and Claude-3.7-Sonnet at $+3.11\%$, while none of the six agents outperformed the A-share SSE-50 benchmark ($+1.65\%$). Performance was even weaker when looking at cryptocurrencies, where all six agents lost money, and only DeepSeek-v3.1 ($-12.18\%$) outperformed the benchmark ($-14.30\%$).
+
+Such findings describe individual agents trading alone, suggesting that raw model capability may not always provide reliable or consistent trading performance. They offer no evidence on whether combining multiple of such agents into a coordinating system improves overall trading performance, or if it simply adds an extra coordination cost without a clear benefit. Previous work~\cite{nguyen2026} formalizes whether coordination may outweigh cost as a coordination breakeven problem, asking whether a multi-agent system's performance advantage exceeds the added costs its coordination introduces. However, they propose this analytically, without applying it to a working system based on realistic market conditions or reporting empirical results. Other work~\cite{yuan2026traderbench} evaluates trading agents under adversarial market conditions based on real trading performance, but holds agent architecture fixed and does not evaluate them across multiple time windows, seeds, making the results unclear whether the agents exhibited actual stability and success under varied and adversarial trading conditions, or simply any successes whether the result of high variance, where specific conditions at that specific time caused that specific success. Benchmarks such as PredictionMarketBench~\cite{arora2026} replays historical trades through a trading simulator with real market factors integrated, such as maker/taker fee modeling, and outputs reproducible execution logs. However, this simulator evaluates each system's execution quality in isolation, without comparing coordinated and single-agent systems to attribute performance differences to coordination. Existing benchmarks lack jointly enforced temporal integrity, execution realism, coordination-cost accounting, and regime-robustness evaluation. Because existing benchmarks test for different metrics of an agent's performance and realistic trading on different datasets and on varied enforcement of real market factors, pressures, and fluctuations, performance differences between systems may reflect the conditions each was tested under rather than differences in the agent's design. Evaluation error in this space carries direct financial costs. A trading system that may appear superior and successful under singular market environments can fail in realistic environments, which enforce testing under a multitude of different-behaving markets and apply real market factors and execution costs.
+
+We address this gap with PIERCEBench (Point-in-time Integrity, Impact Aware, Execution Realism, Regime robustness, Coordination value, Evaluation), a unified benchmark that evaluates single-agent and multi-agent trading systems under identical data, market regimes, and execution rules. The benchmark jointly measures four properties: whether a system accesses information unavailable at decision time, whether its performance holds after realistic transaction costs, whether it performs consistently across market regimes, and whether its returns reflect genuine skill or general market exposure and movement. Concretely, we build (1) a data pipeline that blocks any agent, including communicating agents, from accessing information after its decision point; (2) a trading simulator that replays historical fees and slippage and can re-price the same trade log under different cost assumptions; (3) a scoring stage that reports all four properties with confidence intervals across multiple market periods; and (4) a direct test of whether a multi-agent system's performance advantage survives realistic transaction costs relative to a single-agent baseline.
+
+\section{Related Work}
+
+Previous research on testing trading agents typically examines four aspects individually: temporal integrity, execution realism, regime robustness, and coordination value. Xia et al.~\cite{xia2025} reviewed 19 studies on LLM trading agents, finding only two that used a clean time-based data split and just one that employed a real cost model. This indicates that these four checks are often conducted separately rather than together.
+
+\paragraph{Temporal integrity.} Look-Ahead-Bench~\cite{benhenda2026} assesses how a model's performance declines when transitioning from training data to new data, noting a drop of over 15 percentage points for standard models, while purpose-built models remain stable. Although it confirms the presence of data leakage, it lacks a trading simulator, cost model, and coordination test. KTD-Fin~\cite{zhu2026ktdfin} addresses this same risk differently, concealing tickers and dates from the model so it cannot substitute memory for reasoning. Our approach takes a different route to the same goal: rather than masking identifiers, we integrate the check directly into the data layer, verifying every data access against a real availability timestamp, with a full audit of every request rather than a sample. We also apply this check to inter-agent messages, a potential leak path not addressed by either study, since both test one agent at a time.
+
+\paragraph{Execution and regime realism.} PredictionMarketBench~\cite{arora2026} is closest to our own simulator, replaying historical order-book data with fees and maintaining a reproducible log. However, it focuses on prediction markets and tests single agents, not evaluating the cost-effectiveness of coordination. TraderBench~\cite{yuan2026traderbench} challenges agents under difficult conditions, revealing that 8 out of 13 models show minimal behavioral change, suggesting a lack of adaptation. It maintains the same agent design throughout and reports single figures without confidence intervals. FINSABER~\cite{li2025finsaber} highlights a related issue: LLM trading advantages seen in short backtests often vanish in longer tests spanning two decades and over 100 stocks. We replay real historical fills, incorporate a market-impact cost model, and run a coordination-cost test absent from all three. Our tests span real historical market conditions, including calm periods and actual crashes, and we report results with confidence intervals from resampling.
+
+\paragraph{Coordination value.} Systems like TradingAgents~\cite{xiao2024ta} show benefits from dividing trading decisions among multiple agents, but neither accounts for the added cost of coordination, so it's unclear whether reported gains would persist once that cost is counted. DeepFund~\cite{li2025deepfund} partially addresses this by testing live after a model's training cutoff, rather than on historical data, but it also omits coordination costs. Nguyen and Pham~\cite{nguyen2026} identify this cost gap directly and propose the Coordination Breakeven Spread to determine whether an advantage outweighs its cost, but they only describe the metric without testing it on a working system. We implement their concept, as we hold a system's real trade log fixed, incrementally raising an assumed fee until one system's advantage over another is nullified by its own measured cost.
+
+No previous work applies all four checks to the same system under consistent conditions. Our approach does, for both single- and multi-agent systems, ensuring that differences between systems arise from the systems themselves, not from the benchmarks used to test them.
+
+\section{Method}
+
+The benchmark runs in four phases: point-in-time data preparation (Phase 1), an agent decision interface (Phase 1.5), execution replay (Phase 2), and joint metric scoring (Phase 3). Phase 1 produces a point-in-time data store and regime-labeled episodes; Phase 1.5 turns each day's snapshot into a validated order; Phase 2 turns each order into a real fill and portfolio value; Phase 3 turns the accumulated fills and value series into four scored properties with confidence intervals. The pipeline is identical for single-agent and multi-agent systems; nothing downstream of Phase 1.5 depends on which.
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[b]{\linewidth}
+    \centering
+    \includegraphics[width=0.92\linewidth]{fig3_pipeline_baseline.pdf}
+    \caption{Single-agent baseline pipeline (4 backbones, full 20-ticker universe, daily cadence).}
+    \label{fig:pipeline-baseline}
+  \end{subfigure}
+  \par\vspace{0.6em}
+  \begin{subfigure}[b]{\linewidth}
+    \centering
+    \includegraphics[width=0.92\linewidth]{fig4_pipeline_tradingagents.pdf}
+    \caption{TradingAgents versus matched single-agent control pipeline.}
+    \label{fig:pipeline-tradingagents}
+  \end{subfigure}
+  \caption{The four-phase benchmark pipeline instantiated for (a) the single-agent backbone comparison and (b) the TradingAgents-versus-matched-control comparison. Phases 1, 2, and 3 are shared; only the Phase 1.5 decision interface and, for the TradingAgents run, the evaluation scope and cadence, differ.}
+  \label{fig:pipelines}
+\end{figure}
+
+\subsection{Point-in-Time Data Preparation (Phase 1)}
+
+Every record such as prices, fundamentals, news, quotes, and corporate actions carries an available\_at timestamp. A query at decision time $t$ returns only rows with available\_at $< t$; a violating request is blocked and logged, which is given to the temporal integrity check in Section 3.5. The same rule governs inter-agent messages. Cross-agent memory leakage is instead prevented at the episode-scheduling level: TradingAgents' cross-episode self-reflection memory is protected by executing all 18 episodes in true chronological order rather than the regime-grouped order the episode set is otherwise stored in, so a decision dated in 2010 can never read a memory entry the system wrote for a later-dated episode. A module implementing per-message provenance checking exists in the codebase but is not currently invoked in Phase 1, Phase 3, or the TradingAgents integration, and is not an active safeguard in this study. An independent second check re-verifies the complementary condition on every snapshot request, not a sample, and was confirmed against deliberately malformed timestamps to report a violation in every constructed case rather than passing by default.
+
+Regimes are labeled by two signals. A walk-forward hidden Markov model~\cite{hamilton1989} (three states: trending, mean-reverting, crisis) is fit over return and realized volatility (the standard deviation of daily returns over a trailing window), refit every 63 trading days using only prior data, with 8 restarts per fit; alone it identifies 2 crisis episodes over 2010--2023. A VIX threshold (CBOE's expected-volatility index; close above 30 for at least 5 days, gaps $\leq$45 days merged) identifies 6. Episodes are non-overlapping windows separated by a 14-day purge gap~\cite{lopezdeprado2018}, excluding data near each boundary so volatility from one episode does not bleed into the label of its neighbor; agent state resets at every episode start.
+
+The design uses 18 episodes, 6 per regime, from a time range of 2010--2023, and 20 tickers. Trending and mean-reverting windows are drawn from the same systematic HMM process, spread across different years, and verified as pairwise non-overlapping. Each regime totals approximately 370 trading-day observations, sufficient that the bootstrap intervals in Section 3.5 are not dominated by sampling noise. A Fama-French-Carhart six-factor daily series (Mkt: market excess return; SMB: small-minus-big size effect; HML~\cite{fama1993}: high-minus-low value effect; RMW: robust-minus-weak profitability effect; CMA: conservative-minus-aggressive investment effect~\cite{fama2015}; MOM: momentum~\cite{carhart1997}) and risk-free rate, from the Ken French Data Library~\cite{frenchlib}, are prepared here for Section 3.5.
+
+\subsection{Agent Decision Interface}
+
+Each trading day, the agent receives per ticker: prior close, 5/21/63-day returns, realized volatility, fundamentals (leverage, current ratio, return on assets), and a count, not text, of recent news items, preserving volume as signal while removing a prompt-injection surface. It also receives its own cash, positions, and 10-day trade history. The regime label is withheld, so the test measures whether a strategy survives an unlabeled shift and not whether the agent can read a label; realized volatility, an HMM input feature itself, stays visible.
+
+The agent returns one decision per day: action, symbol, quantity, order type, and, where applicable, a limit price. Three order types are available: market (fills immediately at the best available price), limit (fills immediately only if the market already satisfies the stated price; otherwise, it rests), and post-only (rejected rather than filled immediately, guaranteeing it only fills by waiting). Each decision is validated: the symbol must be in the universe, the sell quantity is clipped to the position actually held and is read from the execution engine's state, and buy quantity is clipped by cash affordability at the pre-decision price. A ticker with no price data that day falls back to hold rather than aborting the episode.
+
+The loop runs unmodified across three backends (native Anthropic API, Azure AI Foundry's OpenAI-compatible routing layer, and Anthropic via Azure Marketplace), so cross-model comparison does not depend on one provider's interface. Calls retry with capped exponential backoff (each wait roughly doubles, up to a maximum) on transient failures, not on errors that would fail identically every time, preventing an unretried transient failure from being mistaken for an intentional hold. Token usage and latency are measured per call, feeding the coordination-cost accounting in Section 3.5.
+
+\subsection{TradingAgents Decision Interface}
+
+For the TradingAgents baseline, the same execution environment and portfolio accounting framework is used, with the decision-making component replaced by the TradingAgents multi-agent system~\cite{xiao2024ta}. TradingAgents uses a LangGraph-based architecture: four analyst roles, fundamentals, sentiment, news, and market, each produce an independent read of the ticker; a bull and a bear researcher debate those reads; a research manager resolves the debate into a directional view; a trader converts that view into a proposed position; and a three-member risk team, aggressive, conservative, and neutral, debates the proposal before a portfolio manager issues a final rating that maps deterministically to a rebalancing target. Because running the full multi-agent pipeline carries substantially higher computational and API cost than a single model call, TradingAgents is not consulted every trading day. Instead, it is consulted at an asymmetric, regime-conditioned frequency: once every 21 trading days during crisis episodes, and once every 63 trading days otherwise. The regime label itself is never given to the system, so this frequency change alone does not tell TradingAgents which regime it is in; its performance is still evaluated under an unlabeled distribution shift. TradingAgents is also restricted to a 3-ticker universe (AAPL, MSFT, GOOG), rather than the full 20-ticker universe the single-agent baselines trade.
+
+When TradingAgents is consulted, the resulting trade decision goes through the same validation and execution process as the single-agent baselines before being sent to the Phase 2 execution replay engine. No new TradingAgents decision is made between consultation dates; the portfolio is still marked to market and its value recorded every trading day, so the final JSON export keeps the same daily structure as the baseline agents' output and can be read by the same downstream analysis code. This format compatibility does not by itself make TradingAgents' results comparable to the full-universe daily baselines above, however: TradingAgents runs on a reduced 3-ticker universe at this asymmetric cadence, so a direct comparison would confound the effect of coordination with the effects of deciding less often and trading fewer instruments. The valid comparison is against a matched single-agent Kimi-K2.6 control, run on the identical 3 tickers, episodes, and per-regime cadence, which isolates coordination as the only varying factor.
+
+\subsection{Execution Replay}
+
+Each validated order is filled using a synthesized bid/ask/depth model: the bid and ask are derived from that trading day's closing price under a fixed 5-basis-point spread, and available depth is set to 2\% of trailing average daily volume. This is a placeholder mechanism rather than a validated microstructure model, applied identically to every fill across all 18 episodes; real intraday Alpaca quotes are collected separately but are not currently consumed by the fill engine. At any moment, a stock has a bid (the highest price a buyer will pay) and an ask (the lowest price a seller will accept); an order that fills immediately must cross this spread, paying the ask on a buy or accepting the bid on a sell, rather than posting its own price and waiting. Market orders and marketable limit orders cross the spread and pay the taker fee; post-only and resting limit orders supply the price others cross to and receive the (here, negative, i.e., rebated) maker fee.
+
+Taker fills also incur market impact, priced with a square-root market-impact model, in the temporary-impact framework of Almgren and Chriss~\cite{almgren2000}:
+\[
+p_{exec} = p_{touch} \times \left(1 \pm \gamma \cdot \sigma \cdot \sqrt{q / ADV}\right)
+\]
+where $p_{touch}$ is the best bid or ask at the fill, $\gamma$ the impact coefficient, $\sigma$ realized volatility, $q$ order size, and $ADV$ average daily volume, with sign matching trade direction. Impact applies only to taker fills, since a resting order supplies rather than consumes depth. Three constraints are enforced at fill time: quantity is capped at available depth; a buy cannot exceed cash on hand once the post-impact, post-fee price is known, a check the Phase 1.5 estimate cannot be made in advance; and a limit order never executes worse than its stated limit. Fees are charged on the post-slippage notional (execution price $\times$ quantity). The portfolio is marked to that day's close every day, not the prior decision-time snapshot, avoiding a one-day lag in the return series.
+
+\subsection{Joint Metric Scoring}
+
+All four properties are computed from one execution history, not four separate passes.
+
+Temporal integrity passes if the aggregated access log contains zero flagged violations across every episode. Regime robustness reports per-episode Sharpe, Sortino, net return, and max drawdown, grouped by regime and summarized as mean $\pm$ std within each, so a regime-specific collapse is not averaged away by strong performance elsewhere.
+
+With $r_t$ the simulated return on day $t$ and $r_f$ the matching risk-free rate:
+\[
+\text{Sharpe} = \left(\frac{\text{mean}(r_t - r_f)}{\text{std}(r_t - r_f)}\right) \times \sqrt{252} \quad \cite{sharpe1966}
+\]
+\[
+\text{Sortino} = \left(\frac{\text{mean}(r_t - r_f)}{\sqrt{\frac{1}{N}\sum_t \min(r_t - r_f, 0)^2}}\right) \times \sqrt{252}
+\]
+Sortino follows Sortino and Price~\cite{sortino1994}: the denominator is the downside semi-deviation over all $N$ observations (positive-return days set to zero, not dropped), not the standard deviation of a filtered negative-only subset, which would be a different, non-standard statistic and would generally understate risk. Both use simulated returns from actual fills.
+
+Attribution regresses excess returns on the six factors defined in Section 3.1:
+\[
+r_t - r_f = \alpha + \beta_{mkt}\cdot Mkt_t + \beta_{smb}\cdot SMB_t + \beta_{hml}\cdot HML_t + \beta_{rmw}\cdot RMW_t + \beta_{cma}\cdot CMA_t + \beta_{mom}\cdot MOM_t + \varepsilon_t
+\]
+reported at CAPM~\cite{sharpe1964}, three-factor~\cite{fama1993}, and six-factor specifications~\cite{fama2015,carhart1997}, so a shrinking alpha as factors are added flags exposure to a known return source rather than skill. A positive six-factor alpha indicates returns unexplained by any included factor; it does not by itself prove skill.
+
+95\% confidence intervals for Sharpe, Sortino, and alpha use a circular moving-block bootstrap~\cite{politis1992,kunsch1989}: 1,000 resamples of contiguous 21-day blocks, drawn with wraparound (a block may start near the series' end and continue from its beginning) so edge days are sampled as often as interior ones. This preserves the short-range autocorrelation in daily returns that independent day-by-day resampling would remove, which would otherwise understate the interval's true uncertainty.
+
+Coordination value sweeps an added fee $c$ upward from zero, holding trade history, costs, and regime labels fixed, and reports:
+\[
+c^* = \min\{c \geq 0 : \text{CumulativeAdvantage}(c) \leq 0\}
+\]
+where CumulativeAdvantage($c$) is the difference in cumulative net return between the comparison and baseline systems after re-charging every logged fill at rate $c$, computed by re-scoring Phase 2's log rather than re-simulating. An advantage surviving a large $c$ indicates a benefit robust to cost assumptions; one vanishing near $c = 0$ indicates a benefit specific to the original run's costs. Both systems must share an identical episode set, which the pipeline verifies before computing any comparison. A companion accounting layer charges the comparison system for its own coordination overhead (token cost plus a latency-driven signal-decay penalty, reducing a decision's effective value in proportion to how much market-relevant time passed while it was still deliberating). This means that an advantage is measured net of the cost required to produce it.
+
+\section{Experimental Setup}
+
+\paragraph{Data Sources} Three distinct sources feed the point-in-time store, each timestamped differently and enforced accordingly. Prices and news come from FNSPID~\cite{dong2024fnspid}, a large-scale financial dataset pairing daily OHLCV price series with time-stamped news articles across roughly 4,800 S\&P 500-listed companies from 1999 to 2023, aggregated from public financial news outlets; each article's own publication timestamp is the available\_at value used to gate what an agent can see. Fundamentals come from SEC EDGAR~\cite{secedgar} as structured, XBRL-tagged facts (total liabilities, total assets, current assets and liabilities, net income) rather than free-text filings, timestamped by the filing's actual acceptance date rather than the fiscal period it describes; a company's Q1 2020 balance-sheet figures are only marked available once the corresponding 10-Q was accepted by EDGAR, typically weeks to months after the fiscal period ends, which is the look-ahead gap this timestamping choice is designed to close. Derived ratios exposed to agents (leverage ratio, current ratio, return on assets) are computed from the most recent as-filed facts known as of the decision date, never from restated or later-corrected values. Execution-level detail, the bid/ask/depth model driving fill prices and market impact in Phase 2, is synthesized from each day's closing price under a fixed spread and volume-based depth cap. Intraday Alpaca minute-resolution bars and NBBO quotes are collected separately, at materially finer granularity than the daily series used for decision-time features, but are not currently consumed by the fill engine and instead feed only the coordination-cost calculation, and only from 2016 onward.
+
+\paragraph{Evaluation Universe and Episodes} The tradable universe comprises 20 equities (AAPL, MSFT, GOOG, AMZN, INTC, NVDA, TSLA, JPM, V, JNJ, WMT, CL, XOM, ABBV, LOW, AXP, DIS, WFC, KO, PFE). A separate set of three tickers, SPY, GLD, and FXI, functions exclusively as a passive-return comparator, not as a tradable instrument: None of them are eligible for agent-issued trades, and none contributes to the fundamentals-derived ratios computed for the tradable universe, since exchange-traded funds file no periodic reports with the SEC and are assigned no CIK. SPY and GLD occupy this role directly as specified in the original proposal; FXI substitutes for the proposal's originally specified MCHI, a China-focused exchange-traded fund whose FNSPID coverage terminates on 2020-07-02, again a data-availability substitution rather than a methodological choice. SPY carries two further, unrelated functions within the pipeline: it defines the trading calendar against which all episodes are indexed, and its price series is the sole input to the walk-forward regime-labeling procedure described next.
+
+Episodes are sampled from the regime timeline produced by the HMM/VIX labeling procedure in \S3.1: 18 non-overlapping episodes (62 trading days on average, 6 per regime), drawn from January 2010 through December 2023 and separated by the same 14-day purge gap described there. Exact window boundaries for all 18 episodes are listed in Appendix Table A1. Every episode begins with \$100,000 in cash and zero holdings.
+
+\paragraph{Single-Agent Baselines} Each of the four backbones, Claude Opus 5, GPT-5.6-Sol, DeepSeek-V4-Pro, and Kimi-K2.6, runs the single-agent decision loop described in the Method Section. Each runs one model call per trading day, deciding across the full 20-ticker universe within that single call, issuing at most one trade per day. Every baseline is evaluated at full daily cadence across all 18 episodes, a decision on each of the roughly 1,126 trading days the episodes span. Completed inference cost, measured directly rather than estimated, was \$30.34 for Claude Opus 5, \$23.47 for GPT-5.6-Sol, \$6.92 for DeepSeek-V4-Pro, and \$15.61 for Kimi-K2.6.
+
+\paragraph{TradingAgents versus a Matched Single-Agent Control} TradingAgents~\cite{xiao2024ta} (architecture described in \S3.3) cannot be evaluated under the same conditions as the single-agent baselines. During integration, we found that its fundamentals vendor ignores the curr\_date parameter passed to it and always returns the company's current, live snapshot regardless of what historical date is being simulated, an unconditional look-ahead leak. As a result, we replaced it with a drop-in vendor backed by our own point-in-time store, enforcing the same available\_at binding used throughout our own pipeline before running any evaluation episodes.
+
+TradingAgents' pipeline issues on the order of 16 real model calls for a single ticker's single decision, against one call for a single-agent baseline; at the full 20-ticker universe and daily cadence across all 18 episodes, this measured rate prices the run at thousands of dollars, depending on the backbone, and would be unfeasible for our study. The \S3.3 reductions follow directly from this cost: the 3-ticker universe is the first three tickers of the same ordered 20-ticker list used for the baselines, a deterministic, cost-constrained convenience subset, and the cadence gate yields 3 decisions per 62-day crisis episode against 1 per trending or mean-reverting episode, concentrated on crisis episodes because the reduced budget could not support dense sampling across all three regimes.
+
+Both TradingAgents and its control run the same 18 episodes, dates, and regime labels, which are used for the baselines, but in true chronological order rather than the regime-grouped order the episode list is otherwise stored in (all crisis episodes, then all trending, then all mean-reverting). This correction was necessary because TradingAgents maintains a cross-episode self-reflection memory that injects its own past decisions into future prompts; run in regime-grouped order, a decision dated in 2010 could read memory entries the system had already written for a crisis episode dated 2022, a temporal leak the standard point-in-time data-store check does not audit, since that check covers the price, news, and fundamentals loaders only, not this separate internal memory channel. This was confirmed as an actual leak by directly inspecting the memory log of a completed run, and fixed by re-running with episodes sorted by start date before execution.
+
+The matched Kimi-K2.6 control described in \S3.3 additionally runs in the identical chronological episode order established above. The Coordination Breakeven Spread is computed against this cadence- and scope-matched control, not against the full-daily, full-universe Kimi-K2.6 baseline in Table~\ref{tab:baselines}, since comparing TradingAgents' reduced-cadence results against a daily-deciding baseline would confound coordination quality with decision frequency.
+
+\section{Results}
+
+We report single-agent backbone comparison at full scope (5.1), then isolate the effect of TradingAgents' coordination pipeline against a matched single-agent control (5.2).
+
+\subsection{Single-Agent Backbone Comparison}
+
+Table~\ref{tab:baselines} reports aggregate Executable Performance across all four single-agent backbones, each run at full daily cadence across the full 20-ticker universe and all 18 episodes. Max Drawdown and Net Return are equal-weighted averages across the three regime-level means, exact rather than approximate here since each regime contains exactly 6 episodes.
+
+\begin{table}[h]
+  \caption{Aggregate Executable Performance across the four single-agent backbones.}
+  \label{tab:baselines}
+  \centering
+  \resizebox{\textwidth}{!}{%
+  \begin{tabular}{lccccccl}
+    \toprule
+    Backbone & Temporal Integrity & Sharpe (95\% CI) & Sortino (95\% CI) & Max Drawdown & Net Return & Inference Cost \\
+    \midrule
+    Claude Opus 5    & PASS & 1.720 [0.971, 2.624]   & 2.580 [1.380, 4.219] & 6.69\% & \$9{,}347  & \$30.34 \\
+    Kimi-K2.6        & PASS & 1.407 [0.566, 2.309]   & 2.161 [0.822, 3.785] & 7.95\% & \$8{,}962  & \$15.61 \\
+    GPT-5.6-Sol      & PASS & 0.954 [0.128, 1.856]   & 1.315 [0.171, 2.745] & 5.83\% & \$3{,}323  & \$23.47 \\
+    DeepSeek-V4-Pro  & PASS & $-0.819$ [$-1.697$, 0.272] & $-0.993$ [$-1.877$, 0.415] & 6.37\% & $-$\$2{,}502 & \$6.92 \\
+    \bottomrule
+  \end{tabular}%
+  }
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{fig1_baseline_comparison.pdf}
+  \caption{Aggregate Executable Performance across the four single-agent backbones: (a) Sharpe ratio with 95\% CIs, (b) regime-stratified net return, and (c) real measured cost vs.\ Sharpe ratio point estimate.}
+  \label{fig:backbone-comparison}
+\end{figure}
+
+All four backbones pass Temporal Integrity: There were zero flagged access-log violations across every episode for every model. A separate per-backbone breakeven-fee diagnostic returns 0 basis points for all four backbones and is not reported in Table~\ref{tab:baselines}, for a specific reason. The diagnostic sums the notional value (dollar value) of every fill (executed trade) in an episode, counting each sell as positive and each buy as negative, then searches for the per-trade fee at which that signed sum crosses zero. That search only produces a meaningful crossing when a strategy closes out every position it opens within the episode, selling back everything it bought or covering everything it shorted, which we refer to here as a round trip. When a backbone instead ends an episode still holding a position it opened, without selling it back down to flat, the signed sum never crosses zero as the fee is swept, and the diagnostic returns 0 basis points by default regardless of whether the position was profitable. This condition, holding a position open past the end of an episode rather than closing it, is common in trending and crisis regimes. Net Return in Table~\ref{tab:baselines} is computed from actual portfolio value rather than fill notional and does not share this limitation; it is positive for three of the four backbones.
+
+Three of the four backbones (Opus, Kimi, GPT-5.6-Sol) have Sharpe confidence intervals that exclude zero, a statistically distinguishable positive result. DeepSeek-V4-Pro is the exception: its CI spans [$-1.70$, 0.27], crossing zero, so its negative point estimate cannot be distinguished from a null result at 95\% confidence, consistent with its regime-level performance below.
+
+Only Claude Opus 5 and Kimi-K2.6 have six-factor alpha confidence intervals that exclude zero (0.094--0.307 and 0.0095--0.411 respectively), a source of return unexplained by market, size, value, profitability, investment, or momentum factors. Both remain stable across the CAPM$\rightarrow$3-factor$\rightarrow$6-factor ablation rather than shrinking toward zero (Opus: 0.249$\rightarrow$0.235$\rightarrow$0.201; Kimi: 0.251$\rightarrow$0.225$\rightarrow$0.199), so the signal is not an artifact of under-specifying the factor model. GPT-5.6-Sol's alpha CI [$-0.052$, 0.142] and DeepSeek's [$-0.324$, 0.010] both cross zero; GPT-5.6-Sol's positive Sharpe point estimate is therefore not distinguishable from factor exposure at this sample size.
+
+Regime-level results diverge from the aggregate ranking (Figure~2). Ranked by full-sample Sharpe, Opus leads; but stratified by regime, Kimi-K2.6 posts the single highest raw net return of any backbone in the crisis regime specifically (\$12{,}929 vs.\ Opus's \$10{,}857), while trailing Opus in both trending (\$9{,}990 vs.\ \$12{,}208) and mean-reverting (\$3{,}968 vs.\ \$4{,}978) regimes. DeepSeek-V4-Pro's negative returns are concentrated in the trending and mean-reverting regimes ($-$\$5{,}824 and $-$\$2{,}593) rather than crisis, where it posts a small positive net return (\$912), a pattern the aggregate Sharpe of $-0.819$ does not show.
+
+Cost and performance are not monotonically related (Figure~2). DeepSeek-V4-Pro is both the cheapest backbone tested (\$6.92) and the only one with a negative Sharpe point estimate and negative Net Return ($-$\$2{,}502). Kimi-K2.6, at roughly half Opus's cost (\$15.61 vs.\ \$30.34), reaches 82\% of Opus's Sharpe point estimate and has an alpha CI that, like Opus's, excludes zero. Spending more on GPT-5.6-Sol (\$23.47) did not produce a higher Sharpe point estimate than spending less on Kimi.
+
+\subsection{TradingAgents versus a Matched Single-Agent Control}
+
+This comparison isolates the effect of TradingAgents' multi-agent coordination pipeline from the effect of backbone choice, ticker scope, or decision cadence: both systems use the same Kimi-K2.6 backbone, the same 3-ticker universe, the same 18 episodes in identical chronological order, and the same per-regime decision cadence (\S3.3). The only variable is whether one model decides alone or four analyst roles, a bull/bear debate, a research manager, a trader, and a three-member risk team decide together.
+
+\begin{table}[h]
+  \caption{TradingAgents versus a matched single-agent Kimi-K2.6 control.}
+  \label{tab:coordination}
+  \centering
+  \resizebox{\textwidth}{!}{%
+  \begin{tabular}{lcccc}
+    \toprule
+    System & Sharpe (95\% CI) & Sortino (95\% CI) & 6-factor $\alpha$ (95\% CI) & Total Cost \\
+    \midrule
+    Matched-Control Kimi-K2.6 & 1.020 [0.293, 1.758] & 1.561 [0.417, 2.953] & 0.0857 [$-0.072$, 0.227] & \$0.34 \\
+    TradingAgents             & 0.650 [$-0.187$, 1.450] & 0.943 [$-0.257$, 2.246] & $-0.0032$ [$-0.018$, 0.009] & \$33.41 \\
+    \bottomrule
+  \end{tabular}%
+  }
+\end{table}
+
+The matched control's Sharpe and Sortino confidence intervals both exclude zero, a statistically distinguishable positive result. TradingAgents' do not: its Sharpe CI spans [$-0.187$, 1.450] and its Sortino CI spans [$-0.257$, 2.246], each crossing zero, so its performance is not distinguishable from a null (no-skill) result at this sample size. We did not run a paired significance test comparing the two systems' Sharpe ratios directly, so these two facts alone do not establish that the control's Sharpe is significantly higher than TradingAgents'. What they do establish: the control's point estimate is higher than TradingAgents' on every metric and in every regime reported in this section, and only the control's estimate clears the threshold of being distinguishable from zero.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{fig2_tradingagents_comparison.png}
+  \caption{TradingAgents versus the matched single-agent Kimi-K2.6 control: (a) risk-adjusted performance with 95\% CIs, (b) regime-stratified net return, and (c) real measured coordination cost on a log scale.}
+  \label{fig:tradingagents-comparison}
+\end{figure}
+
+The regime-level net returns show the same direction in every regime (Figure~3): the matched control outreturns TradingAgents by roughly 14x in crisis (\$4{,}177 vs.\ \$296), 15x in trending (\$9{,}074 vs.\ \$599), and 6x in mean-reverting (\$3{,}929 vs.\ \$667). Neither system's alpha CI excludes zero; the matched control's positive point estimate (0.0857) has a CI [$-0.072$, 0.227] wide enough to include zero, so it is not evidence of significant skill by itself, though its sign agrees with the Sharpe, Sortino, and net-return advantage above. TradingAgents' alpha point estimate is close to zero either way ([$-0.018$, 0.009]).
+
+\paragraph{Coordination cost, charged.} TradingAgents made 94 real ticker-decisions across 32 real decision-days over its 18 episodes (12.2M input / 5.4M output tokens), against the matched control's 32 decision-days (one ticker-decision each, 32 total), a real measured cost of \$33.41 versus \$0.34, roughly 98x. This gap reflects real coordination overhead rather than a difference in scope or cadence: TradingAgents made roughly 16 LLM calls per ticker-decision (four analyst roles, a bull/bear debate, a research manager, a trader, a three-member risk team), while the matched control made one. Sweeping an added fee upward from the systems' real logged costs, the Coordination Breakeven Spread is 0 basis points in both directions, with trading costs only and with the full coordination bill charged: there is no cost level, however small, at which TradingAgents' pipeline would have been worth running instead of the single-agent control over this episode set. This follows directly from the control's point estimate already leading in every regime before any coordination cost is applied; charging the cost only widens the gap.
+
+\paragraph{Scope of this comparison.} This result is specific to a 3-ticker universe, Kimi-K2.6 as the shared backbone, and a crisis-concentrated 21/63-day cadence, not a claim about TradingAgents' architecture in general, at full ticker scope, at daily cadence, or with a different backbone. Section 6 discusses how these scope choices were forced by real measured cost (\S3.3) and what would be needed to test the full-scope condition.
+
+\section{Conclusion}
+
+This project set out to answer two related questions about LLM-driven trading systems. Mainly, how much of reported performance is attributable to backbone model choice rather than system design, and whether a multi-agent coordination pipeline earns back its real dollar cost once that cost is actually charged against its performance rather than assumed away. Both questions required point-in-time-safe data, realistic execution, and, critically, real measured API cost rather than estimated cost, none of which is standard practice across the broader LLM-trading-agent literature (\S2). The results below should be read with that scope in mind: they are precise within the conditions tested, not general claims about either backbone selection or multi-agent architectures beyond them.
+
+Across the four single-agent backbones evaluated at full scope (daily cadence, the full 20-ticker universe, all 18 episodes) and the TradingAgents-versus-matched-control comparison, the harness logged zero point-in-time violations across every result reported in Table~\ref{tab:baselines} and Table~\ref{tab:coordination}, confirming every scored decision was made without access to future information. Within that clean data foundation, backbone choice, not spend, determined which systems produced a statistically distinguishable trading edge: Claude Opus 5 and Kimi-K2.6 were the only two backbones with six-factor alpha confidence intervals excluding zero, a result stable across the CAPM-to-six-factor ablation, while GPT-5.6-Sol and DeepSeek-V4-Pro were not, despite GPT-5.6-Sol costing more to run than Kimi-K2.6. Cost and quality were not otherwise correlated in either direction: DeepSeek-V4-Pro was simultaneously the cheapest backbone tested and the only one with a negative Sharpe point estimate, while Kimi-K2.6 reached the second-highest Sharpe and the only other statistically distinguishable alpha at roughly half Claude Opus 5's cost, the best cost-adjusted result in the study rather than the highest-spend one. Regime-level results further diverged from the aggregate Sharpe ranking: Kimi-K2.6 posted the highest raw net return of any backbone specifically in the crisis regime, a result the full-sample ranking alone does not surface.
+
+The central comparative result concerns coordination value. Holding backbone, ticker universe, and decision cadence fixed against a matched single-agent control, TradingAgents' four-analyst, debate, and risk-team pipeline did not outperform the control on aggregate Sharpe, Sortino, or six-factor alpha, and its regime-level net return was 6 to 15 times lower than the controls in every regime tested, while costing roughly 98x more to reach (\$33.41 versus \$0.34), a gap driven by roughly 16 real LLM calls per ticker-decision against 1. The Coordination Breakeven Spread is 0 basis points in both directions: no fee level, however small, would have made the coordination pipeline worth running instead of the single-agent control under these tested conditions. This result is scoped to a 3-ticker universe, one backbone, and a crisis-concentrated cadence (\S3.3, \S7), not a general claim about multi-agent coordination architectures. Both comparisons ran through the same execution harness and synthetic fill model described in Method, so the simplification disclosed in \S7 affects the absolute magnitude of the Executable Performance numbers rather than the relative rankings reported above.
+
+Two of the findings above depend specifically on measuring cost and coordination overhead directly rather than assuming them. On Sharpe alone, the four-backbone comparison would still rank Kimi-K2.6 second; the cost figures are what separate it as the more cost-efficient result from GPT-5.6-Sol, which spent more to perform worse. The coordination result depends on the same measurement: TradingAgents' pipeline underperforms the matched control not because of its architecture, its analyst roles, or its debate structure as such, but because its real measured cost, set against its real measured performance gap, produces a Coordination Breakeven Spread of zero. Neither result would be visible from Sharpe ratios alone.
+
+\section{Limitations}
+
+The 20-ticker universe is fixed rather than reconstructed for each historical date, so firms that were prominent during 2010--2023 but were later delisted, acquired, or failed are excluded~\cite{brown1992}. Furthermore, Trade fills are priced from each day's closing price under a fixed spread and a volume-based depth cap, not real intraday quotes; real quotes exist but only from 2016 onward and feed only the coordination-cost calculation, not the fill engine. No episode covers 2008, since SEC EDGAR's structured fundamentals data starts in 2009Q1.
+
+TradingAgents is evaluated on 3 tickers at a reduced, regime-conditioned cadence rather than the full universe and daily cadence used for the single-agent baselines, since full-scope evaluation would cost an estimated \$8{,}000--\$9{,}800 per backbone, which is unfeasible considering our budget; the valid coordination comparison is against a matched single-agent baseline under this same restricted scope, not the full-scope baselines, and is priced at current rates for one model on one hosting route, which billed differently than the same model's other routes during this project. Not every part of TradingAgents was audited for temporal leaks: one r leak was found and fixed in its fundamentals loader, but news retrieval was only spot-checked and its filing-date handling was not confirmed.
+
+\begin{ack}
+% Do not include this section in the anonymized submission, only in the final paper.
+% Declare funding and competing interests here per https://neurips.cc/Conferences/2026/PaperInformation/FundingDisclosure
+\end{ack}
+
+\begin{thebibliography}{31}
+
+\bibitem{almgren2000} Almgren, R., \& Chriss, N. (2000). Optimal execution of portfolio transactions. \textit{Journal of Risk}, 3(2), 5--39.
+
+\bibitem{arora2026} Arora, A., \& Malpani, R. (2026). PredictionMarketBench: A SWE-bench-style framework for backtesting trading agents on prediction markets. \textit{arXiv:2602.00133}.
+
+\bibitem{bailey2014} Bailey, D. H., Borwein, J. M., L\'{o}pez de Prado, M., \& Zhu, Q. J. (2014). Pseudo-mathematics and financial charlatanism: The effects of backtest overfitting on out-of-sample performance. \textit{Notices of the American Mathematical Society}, 61(5), 458--471.
+
+\bibitem{benhenda2026} Benhenda, M. (2026). Look-Ahead-Bench: A standardized benchmark of look-ahead bias in point-in-time LLMs for finance. \textit{arXiv:2601.13770}.
+
+\bibitem{brown1992} Brown, S. J., Goetzmann, W., Ibbotson, R. G., \& Ross, S. A. (1992). Survivorship bias in performance studies. \textit{The Review of Financial Studies}, 5(4), 553--580.
+
+\bibitem{carhart1997} Carhart, M. M. (1997). On persistence in mutual fund performance. \textit{The Journal of Finance}, 52(1), 57--82.
+
+\bibitem{chen2025stockbench} Chen, Y., Yao, Z., Liu, Y., Xin, A., Ye, J., Yu, J., Hou, L., \& Li, J. (2025). StockBench: Can LLM agents trade stocks profitably in real-world markets? \textit{arXiv:2510.02209}.
+
+\bibitem{chen2021finqa} Chen, Z., Chen, W., Smiley, C., Shah, S., Borova, I., Langdon, D., Moussa, R., Beane, M., Huang, T.-H., Routledge, B., \& Wang, W. Y. (2021). FinQA: A dataset of numerical reasoning over financial data. In \textit{Proceedings of EMNLP 2021} (pp. 3697--3711).
+
+\bibitem{dong2024fnspid} Dong, Z., Fan, X., \& Peng, Z. (2024). FNSPID: A comprehensive financial news dataset in time series. \textit{arXiv:2402.06698}.
+
+\bibitem{fama1993} Fama, E. F., \& French, K. R. (1993). Common risk factors in the returns on stocks and bonds. \textit{Journal of Financial Economics}, 33(1), 3--56.
+
+\bibitem{fama2015} Fama, E. F., \& French, K. R. (2015). A five-factor asset pricing model. \textit{Journal of Financial Economics}, 116(1), 1--22.
+
+\bibitem{fan2025aitrader} Fan, T., Yang, Y., Jiang, Y., Zhang, Y., Chen, Y., \& Huang, C. (2025). AI-Trader: Benchmarking autonomous agents in real-time financial markets. \textit{arXiv:2512.10971}.
+
+\bibitem{frenchlib} French, K. R. (n.d.). \textit{Kenneth R. French Data Library}. Tuck School of Business, Dartmouth College.
+
+\bibitem{hamilton1989} Hamilton, J. D. (1989). A new approach to the economic analysis of nonstationary time series and the business cycle. \textit{Econometrica}, 57(2), 357--384.
+
+\bibitem{kunsch1989} K\"{u}nsch, H. R. (1989). The jackknife and the bootstrap for general stationary observations. \textit{The Annals of Statistics}, 17(3), 1217--1241.
+
+\bibitem{li2025deepfund} Li, C., Shi, Y., Wang, C., Duan, Q., Ruan, R., Huang, W., Long, H., Huang, L., Luo, Y., \& Tang, N. (2025). Time travel is cheating: Going live with DeepFund for real-time fund investment benchmarking. \textit{arXiv:2505.11065}.
+
+\bibitem{li2025finsaber} Li, W. W., Kim, H., Cucuringu, M., \& Ma, T. (2025). Can LLM-based financial investing strategies outperform the market in long run? \textit{arXiv:2505.07078}.
+
+\bibitem{li2025hedgeagents} Li, X., Zeng, Y., Xing, X., Xu, J., \& Xu, X. (2025). HedgeAgents: A balanced-aware multi-agent financial trading system. In \textit{Companion Proceedings of the ACM Web Conference 2025}. \textit{arXiv:2502.13165}.
+
+\bibitem{lopezdeprado2018} L\'{o}pez de Prado, M. (2018). \textit{Advances in Financial Machine Learning}. Wiley.
+
+\bibitem{nguyen2026} Nguyen, P., \& Pham, T. (2026). Toward reliable evaluation of LLM-based financial multi-agent systems: Taxonomy, coordination primacy, and cost awareness. \textit{arXiv:2603.27539}.
+
+\bibitem{politis1992} Politis, D. N., \& Romano, J. P. (1992). A circular block-resampling procedure for stationary data. In \textit{Exploring the Limits of Bootstrap} (pp. 263--270). Wiley.
+
+\bibitem{sharpe1964} Sharpe, W. F. (1964). Capital asset prices: A theory of market equilibrium under conditions of risk. \textit{The Journal of Finance}, 19(3), 425--442.
+
+\bibitem{sharpe1966} Sharpe, W. F. (1966). Mutual fund performance. \textit{The Journal of Business}, 39(S1), 119--138.
+
+\bibitem{sortino1994} Sortino, F. A., \& Price, L. N. (1994). Performance measurement in a downside risk framework. \textit{The Journal of Investing}, 3(3), 59--64.
+
+\bibitem{secedgar} U.S. Securities and Exchange Commission. (n.d.). \textit{Financial Statement Data Sets}.
+
+\bibitem{xia2025} Xia, Y., You, P., Wang, T., Liu, F., Qi, H., Wu, X., \& Zhang, S. (2025). Agentic trading: When LLM agents meet financial markets. \textit{arXiv:2605.19337}.
+
+\bibitem{xiao2024ta} Xiao, Y., Sun, E., Luo, D., \& Wang, W. (2024). TradingAgents: Multi-agents LLM financial trading framework. \textit{arXiv:2412.20138}.
+
+\bibitem{yu2023finmem} Yu, Y., Li, H., Chen, Z., Jiang, Y., Li, Y., Zhang, D., Liu, R., Suchow, J. W., \& Khashanah, K. (2023). FinMem: A performance-enhanced LLM trading agent with layered memory and character design. \textit{arXiv:2311.13743}.
+
+\bibitem{yu2024fincon} Yu, Y., Yao, Z., Li, H., Deng, Z., Cao, Y., Chen, Z., Suchow, J. W., Liu, R., Cui, Z., Xu, Z., Zhang, D., Subbalakshmi, K., Xiong, G., He, Y., Huang, J., Li, D., \& Xie, Q. (2024). FinCon: A synthesized LLM multi-agent system with conceptual verbal reinforcement for enhanced financial decision making. \textit{NeurIPS 2024}. \textit{arXiv:2407.06567}.
+
+\bibitem{yuan2026traderbench} Yuan, X., Xu, H., Xu, S., Zou, C., \& Xiong, J. (2026). TraderBench: How robust are AI agents in adversarial capital markets? \textit{arXiv:2603.00285}.
+
+\bibitem{zhu2026ktdfin} Zhu, T., Zhao, W., Sun, R., Luan, B., Lu, J., Wang, S., Li, J., Jiang, D., He, Y., \& Bai, Z. (2026). From knowing to doing: A memory-controlled benchmark for LLM trading agents on stock markets. \textit{arXiv:2605.28359}.
+
+\end{thebibliography}
+
+\appendix
+
+\section{Technical Appendices and Supplementary Material}
+
+\subsection{Table A1: Episode Window Boundaries}
+% TODO: insert the exact start/end dates for all 18 episodes here (regime, start date, end date), as referenced in Section 4.
+
+\newpage
+
+\section*{NeurIPS Paper Checklist}
+
+% IMPORTANT: fill in each Answer/Justification below before submission. All 16 items are required by the venue template; leaving them as [TODO] risks desk rejection.
+
+\begin{enumerate}
+\item \textbf{Claims} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Limitations} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Theory assumptions and proofs} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Experimental result reproducibility} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Open access to data and code} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Experimental setting/details} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Experiment statistical significance} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Experiments compute resources} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Code of ethics} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Broader impacts} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Safeguards} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Licenses for existing assets} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{New assets} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Crowdsourcing and research with human subjects} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Institutional review board (IRB) approvals or equivalent} --- Answer: [TODO] --- Justification: [TODO]
+\item \textbf{Declaration of LLM usage} --- Answer: [TODO] --- Justification: [TODO]
+\end{enumerate}
+
+\end{document}

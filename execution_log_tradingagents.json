@@ -1,0 +1,11 @@
+{
+    "fills": [],
+    "daily_portfolio_values": [
+        {
+            "date": "2023-06-01",
+            "portfolio_value": 100000.0,
+            "cash_balance": 100000.0,
+            "positions": {}
+        }
+    ]
+}
